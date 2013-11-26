@@ -1,0 +1,25 @@
+ngx_feature="nginx_handoff_module"
+ngx_feature_name=
+ngx_feature_run=no
+ngx_feature_incs=
+ngx_feature_path="$ngx_addon_dir/modules $ngx_addon_dir/parsers $ngx_addon_dir"
+ngx_feature_deps="$ngx_addon_dir/ngx_handoff.h $ngx_addon_dir/ngx_handoff_session.h" 
+ngx_handoff_src="$ngx_addon_dir/ngx_handoff.c $ngx_addon_dir/ngx_handoff_core_module.c $ngx_addon_dir/ngx_handoff_log.c $ngx_addon_dir/ngx_handoff_session.c"
+ngx_feature_test="int a;"
+. auto/feature
+
+if [ $ngx_found = yes ]; then
+    CORE_INCS="$CORE_INCS $ngx_feature_path"
+    ngx_addon_name=ngx_handoff_module
+
+    NGX_ADDON_DEPS="$NGX_ADDON_DEPS $ngx_feature_deps $ngx_handoff_parser_deps"
+    NGX_ADDON_SRCS="$NGX_ADDON_SRCS $ngx_handoff_src $ngx_handoff_parser_src"
+
+    EVENT_MODULES="$EVENT_MODULES ngx_handoff_module ngx_handoff_core_module"
+    HTTP_MODULES="$HTTP_MODULES"
+else 
+    cat << END
+    $0: error: the ngx_handoff_module addon error.
+END
+    exit 1
+fi

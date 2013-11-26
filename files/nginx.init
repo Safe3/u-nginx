@@ -1,0 +1,34 @@
+#!/bin/sh /etc/rc.common
+# Copyright (C) 2009-2012 OpenWrt.org
+
+#/usr/sbin/nginx.monitor
+
+START=80
+STOP=10
+
+export EXTRA_HELP="	status	Status the service"
+export EXTRA_COMMANDS="status"
+
+stop() {
+	/usr/sbin/nginx.monitor stop
+	return $?
+}
+start() {
+	/usr/sbin/nginx.monitor start
+	return $?
+}
+restart() {
+	stop
+	sleep 1
+	start
+	return $?
+}
+shutdown() {
+	stop
+	return $?
+}
+status() {
+	/usr/sbin/nginx.monitor status
+	return $?
+}
+#

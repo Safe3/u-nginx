@@ -1,0 +1,25 @@
+ngx_feature="nginx_filter_module"
+ngx_feature_name=
+ngx_feature_run=no
+ngx_feature_incs=
+ngx_feature_path="$ngx_addon_dir/modules $ngx_addon_dir/parsers $ngx_addon_dir"
+ngx_feature_deps="$ngx_addon_dir/ngx_filter.h $ngx_addon_dir/ngx_filter_session.h" 
+ngx_filter_src="$ngx_addon_dir/ngx_filter.c $ngx_addon_dir/ngx_filter_core_module.c $ngx_addon_dir/ngx_filter_log.c $ngx_addon_dir/ngx_filter_session.c"
+ngx_feature_test="int a;"
+. auto/feature
+
+if [ $ngx_found = yes ]; then
+    CORE_INCS="$CORE_INCS $ngx_feature_path"
+    ngx_addon_name=ngx_filter_module
+
+    NGX_ADDON_DEPS="$NGX_ADDON_DEPS $ngx_feature_deps $ngx_filter_parser_deps"
+    NGX_ADDON_SRCS="$NGX_ADDON_SRCS $ngx_filter_src $ngx_filter_parser_src"
+
+    EVENT_MODULES="$EVENT_MODULES ngx_filter_module ngx_filter_core_module"
+    HTTP_MODULES="$HTTP_MODULES"
+else 
+    cat << END
+    $0: error: the ngx_filter_module addon error.
+END
+    exit 1
+fi

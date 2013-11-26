@@ -1,0 +1,125 @@
+#!/bin/sh
+#
+#split from preload.monitor
+#
+#start nginx by nginx.loader, if NGINX_CACHE or NGINX_AUTOCACHE changed, restart nginx
+#
+export LANG=C
+#
+. /lib/lib.scripthelper.sh
+#
+. /lib/lib.wan.monitor.sh
+#
+#export command line for /usr/sbin/supervisord
+export PROCLINE="/usr/sbin/nginx.loader"
+export PROCFLAG="nginx: master process /usr/sbin/nginx -c /tmp/nginxconf/nginx.conf"
+#
+NGINXLOADER="/usr/sbin/supervisord"
+#
+daemonstop(){
+	#
+	/usr/sbin/preload.monitor status >/dev/null 2>&1
+	#0 for running
+	if [ $? -eq 0 ]
+		then
+		dlog "INFO: stop preload catch for nginx stopped."
+		/usr/sbin/preload.monitor stop
+	fi
+	dlog "INFO: stop nginx for monitor stopped."
+	$NGINXLOADER stop noloop
+	return 0
+}
+#
+#run in daemon
+procdaemon mute
+#
+#default
+NGINX_CACHE='on'
+NGINX_AUTOCACHE='on'
+if [ -s "$MONITORCFGFILE" ]
+	then
+	. $MONITORCFGFILE
+fi
+precachesw="CACHE:${NGINX_CACHE}-AUTOCACHE:${NGINX_AUTOCACHE}"
+#
+dlog "INFO: running ..."
+#
+$NGINXLOADER status mute >/dev/null 2>&1
+if [ $? -ne 0 ]
+	then
+	$NGINXLOADER start noloop
+	if [ $? -ne 0 ]
+		then
+		dlog "ERROR: nginx init-start failed."
+		exit 1
+	fi
+fi
+/usr/sbin/preload.monitor status >/dev/null 2>&1
+#0 for running
+if [ $? -ne 0 ]
+	then
+	dlog "INFO: start preload catch for nginx start."
+	/usr/sbin/preload.monitor start
+fi
+nginxdelay=30
+while [ : ]
+do
+	sleep 5
+	#set default
+	NGINX_CACHE='on'
+	NGINX_AUTOCACHE='on'
+	if [ -s "$MONITORCFGFILE" ]
+		then
+		. $MONITORCFGFILE
+	fi
+	$NGINXLOADER status mute >/dev/null 2>&1
+	if [ $? -ne 0 ]
+		then
+		dlog "WARNING: nginx no running, try to restart ..."
+		$NGINXLOADER start noloop
+		sleep 2
+		$NGINXLOADER status mute >/dev/null 2>&1
+		#0 for running
+		if [ $? -ne 0 ]
+			then
+			dlog "WARNING: nginx start failed, sleep $nginxdelay."
+			let nginxdelay=$nginxdelay+30
+			test $nginxdelay -ge 300 && nginxdelay=300
+		else
+			nginxdelay=30
+		fi
+		precachesw="CACHE:${NGINX_CACHE}-AUTOCACHE:${NGINX_AUTOCACHE}"
+		continue
+	fi
+	if [ "$precachesw" != "CACHE:${NGINX_CACHE}-AUTOCACHE:${NGINX_AUTOCACHE}" ]
+		then
+		dlog "WARNING: restart nginx for CACHE configure changed: $precachesw => CACHE:${NGINX_CACHE}-AUTOCACHE:${NGINX_AUTOCACHE}"
+		#cache is not running
+		$NGINXLOADER status mute >/dev/null 2>&1
+		#0 for running
+		if [ $? -eq 0 ]
+			then
+			$NGINXLOADER stop noloop
+			sleep 1
+			$NGINXLOADER start noloop
+			startcode=$?
+		else
+			$NGINXLOADER start noloop
+			startcode=$?
+		fi
+		$NGINXLOADER status mute >/dev/null 2>&1
+		#0 for running
+		if [ $? -ne 0 ]
+			then
+			dlog "WARNING: nginx start failed, sleep $nginxdelay."
+			let nginxdelay=$nginxdelay+30
+			test $nginxdelay -ge 300 && nginxdelay=300
+		else
+			nginxdelay=30
+		fi
+		precachesw="CACHE:${NGINX_CACHE}-AUTOCACHE:${NGINX_AUTOCACHE}"
+	fi
+done
+exit 0
+#
+

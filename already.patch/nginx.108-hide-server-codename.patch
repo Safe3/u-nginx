@@ -1,0 +1,37 @@
+--- a/src/http/modules/ngx_http_proxy_module.c.orig	2013-10-01 18:24:29.665204156 +0800
++++ b/src/http/modules/ngx_http_proxy_module.c	2013-10-01 18:25:53.309204451 +0800
+@@ -566,8 +566,8 @@
+ 
+ 
+ static ngx_str_t  ngx_http_proxy_hide_headers[] = {
+-    ngx_string("Date"),
+-    ngx_string("Server"),
++    ngx_string("Hi-Date"),
++    ngx_string("Hi-Server"),
+     ngx_string("X-Pad"),
+     ngx_string("X-Accel-Expires"),
+     ngx_string("X-Accel-Redirect"),
+--- a/src/core/nginx.h.orig	2013-09-24 10:00:05.754183245 +0800
++++ b/src/core/nginx.h	2013-09-24 10:00:22.182183303 +0800
+@@ -11,7 +11,7 @@
+ 
+ #define nginx_version      1002002
+ #define NGINX_VERSION      "1.2.2"
+-#define NGINX_VER          "nginx/" NGINX_VERSION
++#define NGINX_VER          "MiXr/" NGINX_VERSION
+ 
+ #define NGINX_VAR          "NGINX"
+ #define NGX_OLDPID_EXT     ".oldbin"
+--- a/src/http/ngx_http_header_filter_module.c.orig	2013-09-24 10:03:39.538183998 +0800
++++ b/src/http/ngx_http_header_filter_module.c	2013-09-24 09:58:49.570182977 +0800
+@@ -46,8 +46,8 @@
+ };
+ 
+ 
+-static char ngx_http_server_string[] = "Server: nginx" CRLF;
+-static char ngx_http_server_full_string[] = "Server: " NGINX_VER CRLF;
++static char ngx_http_server_string[] = "Tx-Server: MiXr" CRLF;
++static char ngx_http_server_full_string[] = "Tx-Server: " NGINX_VER CRLF;
+ 
+ 
+ static ngx_str_t ngx_http_status_lines[] = {

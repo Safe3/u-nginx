@@ -1,0 +1,125 @@
+#!/bin/sh
+#
+export LANG=C
+#
+. /lib/lib.scripthelper.sh
+#
+
+CACHELABLE='XQ4709AUTOCACHE'
+NGINXCACHEDIR='/userdisk/nginx'
+PRELOADCTL='/etc/init.d/preload'
+
+SCRIPTTAG='nginx.hotplug'
+
+usage(){
+	elog "USAGE: $SCRIPTSELFT <add|remove> </dev/sdxxx>"
+	return 0
+}
+
+cleanmountdir(){
+	for aaa in 1 2 3 4 5 6 7 8 9 0
+	do
+		mount | grep -q " $NGINXCACHEDIR "
+		test $? -ne 0 && break
+		umount -f -r $NGINXCACHEDIR 2>&1 | pipelog dlog
+		sleep 1
+	done
+}
+
+### main ###
+ACTION="$1"
+device="$2"
+
+test -z "$ACTION" && usage && exit 0
+test -z "$device" && usage && exit 0
+
+#0 for running
+local ispreloadok
+local isnginxok
+
+case "$ACTION" in
+	add)
+		cachedev="$(blkid -L $CACHELABLE)"
+		if [ -z "$cachedev" ]
+			then
+			exit 0
+		fi
+		if [ "$cachedev" != "$device" ]
+			then
+			exit 0
+		fi
+		mkdir -p $NGINXNGINXCACHEDIR >/dev/null 2>&1
+		dlog "INFO: ACTION $ACTION, device matched $cachedev // $CACHELABLE"
+		$PRELOADCTL status >/dev/null 2>&1
+		ispreloadok=$?
+		if [ $ispreloadok -eq 0 ]
+			then
+			$PRELOADCTL stop
+		fi
+		sleep 1
+		mount | grep -q "^${cachedev} on $NGINXCACHEDIR "
+		if [ $? -eq 0 ]
+			then
+			mount | grep "^${cachedev} on $NGINXNGINXCACHEDIR " | grep -q 'rw'
+			test $? -ne 0 && mount -o remount,rw ${cachedev} $NGINXNGINXCACHEDIR 2>&1
+			#dlog "INFO: already mounted: $(mount | grep "^${cachedev} on $NGINXCACHEDIR ")"
+		else
+			cleanmountdir
+			mount $device $NGINXCACHEDIR 2>&1 | pipelog dlog
+			mount | grep -q "$device on $NGINXCACHEDIR "
+			if [ $? -ne 0 ]
+				then
+				dlog "ERROR: mount $device $NGINXCACHEDIR failed."
+				cleanmountdir
+			fi
+		fi
+		if [ $ispreloadok -eq 0 ]
+		then
+			$PRELOADCTL start
+			if [ $? -ne 0 ]
+				then
+				dlog "ERROR: $PRELOADCTL start failed."
+			else
+				dlog "$PRELOADCTL start ok."
+			fi
+		fi
+	;;
+	remove)
+		cachedev="$(df -h "$NGINXCACHEDIR" | grep -v '^Filesystem' | grep " ${NGINXCACHEDIR}$" | awk '{print $1}')"
+		if [ -z "$cachedev" ]
+			then
+			exit 0
+		fi
+		if [ "$cachedev" != "$device" ]
+			then
+			exit 0
+		fi
+		dlog "INFO: ACTION $ACTION, device matched $cachedev // $CACHELABLE"
+		$PRELOADCTL status >/dev/null 2>&1
+		ispreloadok=$?
+		if [ $ispreloadok -eq 0 ]
+			then
+			$PRELOADCTL stop
+		fi
+		sleep 1
+		cleanmountdir
+		sleep 1
+		mount | grep -q "$device on $NGINXCACHEDIR "
+		if [ $? -eq 0 ]
+			then
+			dlog "ERROR: umount $device $NGINXCACHEDIR failed."
+		fi
+		if [ $ispreloadok -eq 0 ]
+		then
+			$PRELOADCTL start
+			if [ $? -ne 0 ]
+				then
+				dlog "ERROR: $PRELOADCTL start failed."
+			else
+				dlog "$PRELOADCTL start ok."
+			fi
+		fi
+	;;
+esac
+exit 0
+#
