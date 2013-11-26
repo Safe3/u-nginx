@@ -1,0 +1,18 @@
+--- a/src/http/ngx_http_upstream.c	2013-11-06 17:32:56.712618024 +0800
++++ b/src/http/ngx_http_upstream.c	2013-11-06 17:34:15.320616306 +0800
+@@ -2258,11 +2258,14 @@
+     if (p->cacheable) {
+         p->temp_file->persistent = 1;
+ 
+-    } else {
++    }
++    /*
++     else {
+         p->temp_file->log_level = NGX_LOG_WARN;
+         p->temp_file->warn = "an upstream response is buffered "
+                              "to a temporary file";
+     }
++    */
+ 
+     p->max_temp_file_size = u->conf->max_temp_file_size;
+ 	p->max_cache_file_size = u->conf->max_cache_file_size;

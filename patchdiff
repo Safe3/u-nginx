@@ -1,0 +1,234 @@
+diff -rua /home/liutao/code/XiaoQiang/feeds/packages/net/nginx/pkg-src/src/core/ngx_connection.c ./src/core/ngx_connection.c
+--- /home/liutao/code/XiaoQiang/feeds/packages/net/nginx/pkg-src/src/core/ngx_connection.c	2013-11-13 20:59:37.788324244 +0800
++++ ./src/core/ngx_connection.c	2013-11-20 17:55:00.960262262 +0800
+@@ -1065,8 +1065,17 @@
+         len = NGX_SOCKADDRLEN;
+ 
+         if (getsockopt (c->fd, SOL_IP, SO_ORIGINAL_DST, (struct sockaddr_in *) &sa, &len)) {
+-            ngx_connection_error(c, ngx_socket_errno, "getsockopt(SO_ORIGINAL_DST) failed");
+-            return NGX_ERROR;
++            //ngx_connection_error(c, ngx_socket_errno, "getsockopt(SO_ORIGINAL_DST) failed");
++            //return NGX_ERROR;
++
++            //note: if cannot get original dest, will set it to 0.0.0.1:65536 as default dest
++            //ngx_log_debug0(NGX_LOG_DEBUG_CORE, c->log, 0, "Cannot get original dest, will set to 0.0.0.1:65535");
++            ngx_log_debug0(NGX_LOG_CRIT, c->log, 0, "Cannot get original dest, will set to 0.0.0.1:65535");
++            struct sockaddr_in * t;
++            t = sa;
++            t->sin_family = c->sockaddr->sa_family;
++            t->sin_port = htons(65535);
++            t->sin_addr.s_addr = inet_addr("0.0.0.1");
+         }
+ 
+         c->dst_sockaddr = ngx_palloc(c->pool, len);
+diff -rua /home/liutao/code/XiaoQiang/feeds/packages/net/nginx/pkg-src/src/event/ngx_event_accept.c ./src/event/ngx_event_accept.c
+--- /home/liutao/code/XiaoQiang/feeds/packages/net/nginx/pkg-src/src/event/ngx_event_accept.c	2013-11-13 20:59:37.792324244 +0800
++++ ./src/event/ngx_event_accept.c	2013-11-20 17:54:41.868262409 +0800
+@@ -173,10 +173,20 @@
+ 
+ #if (NGX_HAVE_TPROXY)
+         if (getsockopt (c->fd, SOL_IP, SO_ORIGINAL_DST, (struct sockaddr_in *) sa, &socklen)) {
+-            ngx_log_error(NGX_LOG_ALERT, ev->log, ngx_socket_errno, "getsockopt(SO_ORIGINAL_DST) failed");
+-            ngx_close_accepted_connection(c);
+-            return;
++            //ngx_log_error(NGX_LOG_ALERT, ev->log, ngx_socket_errno, "getsockopt(SO_ORIGINAL_DST) failed");
++            //ngx_close_accepted_connection(c);
++            //return;
++
++            //note: if cannot get original dest, will set it to 0.0.0.1:65536 as default dest
++            //ngx_log_debug0(NGX_LOG_DEBUG_CORE, c->log, 0, "Cannot get original dest, will set to 0.0.0.1:65535");
++            ngx_log_debug0(NGX_LOG_CRIT, c->log, 0, "Cannot get original dest, will set to 0.0.0.1:65535");
++            struct sockaddr_in * t;
++            t = sa;
++            t->sin_family = c->sockaddr->sa_family;
++            t->sin_port = htons(65535);
++            t->sin_addr.s_addr = inet_addr("0.0.0.1");
+         }
++
+         c->dst_sockaddr = ngx_palloc(c->pool, socklen);
+         if (c->dst_sockaddr == NULL) {
+             ngx_close_accepted_connection(c);
+diff -rua /home/liutao/code/XiaoQiang/feeds/packages/net/nginx/pkg-src/src/tcp/ngx_tcp_core_module.c ./src/tcp/ngx_tcp_core_module.c
+--- /home/liutao/code/XiaoQiang/feeds/packages/net/nginx/pkg-src/src/tcp/ngx_tcp_core_module.c	2013-11-18 21:40:24.652907922 +0800
++++ ./src/tcp/ngx_tcp_core_module.c	2013-11-20 17:11:33.768282160 +0800
+@@ -930,7 +930,7 @@
+ 
+ #if (NGX_HAVE_INET6)
+ //TODO: not support yet
+-static char* ngx_tcp_parse_hostport6(ngx_conf_t *cf, ngx_str_t *value, struct in6_addr *o_host, in_port_t *o_port)
++static char* ngx_tcp_parse_hostport6(ngx_conf_t *cf, ngx_str_t *value, struct in6_addr *o_host, in_port_t *o_port, struct in6_addr dehost)
+ {
+     if (value->len <= 0 || !o_host || !o_port)
+         return NGX_CONF_ERROR ;
+@@ -958,21 +958,25 @@
+ 
+     //get port
+     tport = ngx_atoi(port, last - port);
+-    if(tport != INADDR_NONE)
++    if(tport != NGX_ERROR)
+         *o_port = htons(tport);
+     else
+         return NGX_CONF_ERROR;
+ 
+     //get host
+-    if(ngx_inet6_addr(host,lasthost-host,o_host->s6_addr) != NGX_OK){
+-        return NGX_CONF_ERROR;
++    if(port - host > 0){
++        if(ngx_inet6_addr(host,lasthost-host,o_host->s6_addr) != NGX_OK){
++            return NGX_CONF_ERROR;
++        }
++    }else{
++        *o_host = dehost;  //set to default host, if host is not configured (ipv6 no need to be transformed)
+     }
+ 
+     return NGX_CONF_OK;
+ }
+ #endif
+ 
+-static char* ngx_tcp_parse_hostport(ngx_conf_t *cf, ngx_str_t *value, struct in_addr *o_host, in_port_t *o_port)
++static char* ngx_tcp_parse_hostport(ngx_conf_t *cf, ngx_str_t *value, struct in_addr *o_host, in_port_t *o_port, in_addr_t dehost)
+ {
+     if (value->len <= 0 || !o_host || !o_port)
+         return NGX_CONF_ERROR ;
+@@ -992,7 +996,7 @@
+         len = last - port;
+         tport = ngx_atoi(port, len);
+         if (tport != NGX_ERROR) {
+-            *o_port = htons(tport);
++            *o_port = htons((in_port_t) tport);
+         }
+         else {
+             ngx_conf_log_error(NGX_LOG_ALERT, cf, 0, "TCP redirect, config wrong port format.");
+@@ -1012,10 +1016,10 @@
+ 
+         tport = ngx_atoi(value->data, value->len);
+         if (tport != NGX_ERROR) { //with format of `port`
+-            *o_port = htons(tport);
++            *o_port = htons((in_port_t) tport);
+ 
+             //no port set, will regard it as loopback address
+-            o_host->s_addr = htonl(INADDR_LOOPBACK);
++            o_host->s_addr = htonl(dehost);
+         }
+         else {
+             ngx_conf_log_error(NGX_LOG_ALERT, cf, 0, "TCP redirect, config without port[mandatory].");
+@@ -1033,29 +1037,50 @@
+         return NGX_CONF_ERROR;
+     }
+ 
+-    cscf->redirect = (ngx_tcp_redirect_t *) ngx_palloc(cf->pool,sizeof(ngx_tcp_redirect_t));
+-
+     if(cscf->redirect == NULL){
+-        ngx_conf_log_error(NGX_LOG_ALERT, cf, 0, "TCP redirect, can not set redirect");
++        cscf->redirect = ngx_array_create(cf->pool,8,sizeof(ngx_tcp_redirect_t));
++        if(cscf->redirect == NULL){
++            ngx_conf_log_error(NGX_LOG_ALERT, cf, 0, "TCP redirect, can not get array for redirect");
++            return NGX_CONF_ERROR;
++        }
++    }
++
++    ngx_tcp_redirect_t* t = ngx_array_push(cscf->redirect);
++    if(t == NULL){
++        ngx_conf_log_error(NGX_LOG_ALERT, cf, 0, "TCP redirect, can not get elt for redirect");
+         return NGX_CONF_ERROR;
+     }
+ 
+     ngx_str_t *value=cf->args->elts;
+ 
+-#if(NGX_HAVE_INET6)
+-    //TODO: not support yet
+-    if(ngx_tcp_parse_hostport6(cf, &value[1],&(cscf->redirect->host6.s6_addr),&(cscf->redirect->port))!=NGX_CONF_OK)
+-        return NGX_CONF_ERROR;
++    u_char *p,*q;
+ 
+-    if(ngx_tcp_parse_hostport6(cf, &value[2],&(cscf->redirect->redirect_host6.s6_addr),&(cscf->redirect->redirect_port))!=NGX_CONF_OK)
+-        return NGX_CONF_ERROR;
++    p=value[1].data;
++    q=value[1].data + value[1].len;
++    if(ngx_strlchr(p,q,'[')!= NULL){ //with format of ipv6
++#if(NGX_HAVE_INET6)
++        struct in6_addr anyaddr=IN6ADDR_ANY_INIT;
++        //TODO: need test for ipv6
++        if(ngx_tcp_parse_hostport6(cf, &value[1],&(t->host6),&(t->port),anyaddr)!=NGX_CONF_OK)
++            return NGX_CONF_ERROR;
+ #endif
++    }else{
++        if(ngx_tcp_parse_hostport(cf, &value[1],&(t->host),&(t->port),htonl(INADDR_ANY))!=NGX_CONF_OK)
++            return NGX_CONF_ERROR;
++    }
+ 
+-    if(ngx_tcp_parse_hostport(cf, &value[1],&(cscf->redirect->host.s_addr),&(cscf->redirect->port))!=NGX_CONF_OK)
+-        return NGX_CONF_ERROR;
+-
+-    if(ngx_tcp_parse_hostport(cf, &value[2],&(cscf->redirect->redirect_host.s_addr),&(cscf->redirect->redirect_port))!=NGX_CONF_OK)
+-        return NGX_CONF_ERROR;
++    p = value[2].data;
++    q = value[2].data + value[2].len;
++    if(ngx_strlchr(p,q,'[')!= NULL){ //with format of ipv6
++#if (NGX_HAVE_INET6)
++        struct in6_addr loopaddr=IN6ADDR_LOOPBACK_INIT;
++        if(ngx_tcp_parse_hostport6(cf, &value[2],&(t->redirect_host6),&(t->redirect_port),loopaddr)!=NGX_CONF_OK)
++            return NGX_CONF_ERROR;
++#endif
++    }else{
++        if(ngx_tcp_parse_hostport(cf, &value[2],&(t->redirect_host),&(t->redirect_port),htonl(INADDR_LOOPBACK))!=NGX_CONF_OK)
++            return NGX_CONF_ERROR;
++    }
+ 
+     ngx_conf_log_error(NGX_LOG_DEBUG, cf, 0, "TCP set redirect OK");
+ 
+diff -rua /home/liutao/code/XiaoQiang/feeds/packages/net/nginx/pkg-src/src/tcp/ngx_tcp.h ./src/tcp/ngx_tcp.h
+--- /home/liutao/code/XiaoQiang/feeds/packages/net/nginx/pkg-src/src/tcp/ngx_tcp.h	2013-11-18 21:02:15.608925389 +0800
++++ ./src/tcp/ngx_tcp.h	2013-11-20 13:30:05.632383568 +0800
+@@ -227,7 +227,7 @@
+     ngx_tcp_conf_ctx_t      *ctx;
+ 
+     /* redirection ctx */
+-    ngx_tcp_redirect_t      *redirect;
++    ngx_array_t             *redirect;
+ };
+ 
+ 
+diff -rua /home/liutao/code/XiaoQiang/feeds/packages/net/nginx/pkg-src/src/tcp/ngx_tcp_upstream.c ./src/tcp/ngx_tcp_upstream.c
+--- /home/liutao/code/XiaoQiang/feeds/packages/net/nginx/pkg-src/src/tcp/ngx_tcp_upstream.c	2013-11-18 21:42:03.772907164 +0800
++++ ./src/tcp/ngx_tcp_upstream.c	2013-11-20 17:51:14.672263988 +0800
+@@ -1178,9 +1178,9 @@
+ #if (NGX_HAVE_INET6)
+     struct sockaddr_in6 *oc6;
+ #endif
+-
+     ngx_peer_connection_t *pc;
+     ngx_tcp_core_srv_conf_t  *cscf;
++    int i=0;
+ 
+ 
+     cscf = ngx_tcp_get_module_srv_conf(s, ngx_tcp_core_module);
+@@ -1212,14 +1212,20 @@
+             case AF_INET: /* AF_INET */
+                 oc = (struct sockaddr_in*)pc->sockaddr;
+ 
+-                //if not (localhost + tproxy port), will pass away directly
+-                if(oc->sin_port != cscf->redirect->port ||
+-                        oc->sin_addr.s_addr != cscf->redirect->host.s_addr)
+-                    break;
+-
+-                //change dest host and port to configured redirect port
+-                oc->sin_addr.s_addr = cscf->redirect->redirect_host.s_addr;
+-                oc->sin_port = cscf->redirect->redirect_port;
++                for(i=0;i< cscf->redirect->nelts;++i){
++                    ngx_tcp_redirect_t *t = cscf->redirect->elts;
++
++                    if(oc->sin_port != t[i].port)
++                        continue;
++
++                    if(t[i].host.s_addr != INADDR_ANY && t[i].host.s_addr != oc->sin_addr.s_addr)
++                        continue;
++
++                    //change dest host and port to configured redirect port
++                    oc->sin_addr.s_addr = t[i].redirect_host.s_addr;
++                    oc->sin_port = t[i].redirect_port;
++                    break; //will change to 1st meet
++                }
+ 
+                 break;
+             default:

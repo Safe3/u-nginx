@@ -1,0 +1,2618 @@
+diff --git a/src/core/ngx_log.c b/src/core/ngx_log.c
+index 7cf1491..c7c2026 100755
+--- a/src/core/ngx_log.c
++++ b/src/core/ngx_log.c
+@@ -68,7 +68,7 @@ static ngx_str_t err_levels[] = {
+ 
+ static const char *debug_levels[] = {
+     "debug_core", "debug_alloc", "debug_mutex", "debug_event",
+-    "debug_http", "debug_mail", "debug_mysql", "debug_tcp", "debug_handoff"
++    "debug_http", "debug_mail", "debug_mysql", "debug_tcp", "debug_handoff", "debug_filter"
+ };
+ 
+ 
+diff --git a/src/core/ngx_log.h b/src/core/ngx_log.h
+index 2f9844c..ea0cebd 100755
+--- a/src/core/ngx_log.h
++++ b/src/core/ngx_log.h
+@@ -32,6 +32,7 @@
+ #define NGX_LOG_DEBUG_MYSQL       0x400
+ #define NGX_LOG_DEBUG_TCP         0x800
+ #define NGX_LOG_DEBUG_HANDOFF     0x1000
++#define NGX_LOG_DEBUG_FILTER      0x2000
+ 
+ /*
+  * do not forget to update debug_levels[] in src/core/ngx_log.c
+@@ -39,7 +40,7 @@
+  */
+ 
+ #define NGX_LOG_DEBUG_FIRST       NGX_LOG_DEBUG_CORE
+-#define NGX_LOG_DEBUG_LAST        NGX_LOG_DEBUG_HANDOFF
++#define NGX_LOG_DEBUG_LAST        NGX_LOG_DEBUG_FILTER
+ #define NGX_LOG_DEBUG_CONNECTION  0x80000000
+ #define NGX_LOG_DEBUG_ALL         0x7ffffff0
+ 
+diff --git a/src/filter/config b/src/filter/config
+new file mode 100755
+index 0000000..9e69764
+--- /dev/null
++++ b/src/filter/config
+@@ -0,0 +1,25 @@
++ngx_feature="nginx_filter_module"
++ngx_feature_name=
++ngx_feature_run=no
++ngx_feature_incs=
++ngx_feature_path="$ngx_addon_dir/modules $ngx_addon_dir/parsers $ngx_addon_dir"
++ngx_feature_deps="$ngx_addon_dir/ngx_filter.h $ngx_addon_dir/ngx_filter_session.h" 
++ngx_filter_src="$ngx_addon_dir/ngx_filter.c $ngx_addon_dir/ngx_filter_core_module.c $ngx_addon_dir/ngx_filter_log.c $ngx_addon_dir/ngx_filter_session.c"
++ngx_feature_test="int a;"
++. auto/feature
++
++if [ $ngx_found = yes ]; then
++    CORE_INCS="$CORE_INCS $ngx_feature_path"
++    ngx_addon_name=ngx_filter_module
++
++    NGX_ADDON_DEPS="$NGX_ADDON_DEPS $ngx_feature_deps $ngx_filter_parser_deps"
++    NGX_ADDON_SRCS="$NGX_ADDON_SRCS $ngx_filter_src $ngx_filter_parser_src"
++
++    EVENT_MODULES="$EVENT_MODULES ngx_filter_module ngx_filter_core_module"
++    HTTP_MODULES="$HTTP_MODULES"
++else 
++    cat << END
++    $0: error: the ngx_filter_module addon error.
++END
++    exit 1
++fi
+diff --git a/src/filter/ngx_filter.c b/src/filter/ngx_filter.c
+new file mode 100755
+index 0000000..4b00986
+--- /dev/null
++++ b/src/filter/ngx_filter.c
+@@ -0,0 +1,569 @@
++/*
++ * author : yubo@xiaomi.com
++ */
++#include <ngx_config.h>
++#include <ngx_core.h>
++#include <ngx_event.h>
++#include <ngx_filter.h>
++
++
++static char *ngx_filter_block(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
++static ngx_int_t ngx_filter_add_ports(ngx_conf_t *cf, ngx_array_t *ports,
++    ngx_filter_listen_t *listen);
++static char * ngx_filter_optimize_servers(ngx_conf_t *cf, 
++        ngx_filter_core_main_conf_t *cmcf, ngx_array_t *ports);
++static ngx_int_t ngx_filter_add_addrs(ngx_conf_t *cf, ngx_filter_port_t *mport,
++    ngx_filter_conf_addr_t *addr);
++#if (NGX_HAVE_INET6)
++static ngx_int_t ngx_filter_add_addrs6(ngx_conf_t *cf, ngx_filter_port_t *mport,
++    ngx_filter_conf_addr_t *addr);
++#endif
++static ngx_int_t ngx_filter_cmp_conf_addrs(const void *one, const void *two);
++
++
++ngx_uint_t  ngx_filter_max_module;
++
++
++static ngx_command_t  ngx_filter_commands[] = {
++
++    { ngx_string("filter"),
++      NGX_MAIN_CONF|NGX_CONF_BLOCK|NGX_CONF_NOARGS,
++      ngx_filter_block,
++      0,
++      0,
++      NULL },
++
++      ngx_null_command
++};
++
++
++static ngx_core_module_t  ngx_filter_module_ctx = {
++    ngx_string("filter"),
++    NULL,
++    NULL
++};
++
++
++ngx_module_t  ngx_filter_module = {
++    NGX_MODULE_V1,
++    &ngx_filter_module_ctx,                   /* module context */
++    ngx_filter_commands,                      /* module directives */
++    NGX_CORE_MODULE,                       /* module type */
++    NULL,                                  /* init master */
++    NULL,                                  /* init module */
++    NULL,                                  /* init process */
++    NULL,                                  /* init thread */
++    NULL,                                  /* exit thread */
++    NULL,                                  /* exit process */
++    NULL,                                  /* exit master */
++    NGX_MODULE_V1_PADDING
++};
++
++
++static char *
++ngx_filter_block(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
++{
++    char                        *rv;
++    ngx_uint_t                   i, m, mi, s;
++    ngx_conf_t                   pcf;
++    ngx_array_t                  ports;
++    ngx_filter_listen_t           *listen;
++    ngx_filter_module_t           *module;
++    ngx_filter_conf_ctx_t         *ctx;
++    ngx_filter_core_srv_conf_t   **cscfp;
++    ngx_filter_core_main_conf_t   *cmcf;
++
++
++    /* the main tcp context */
++
++    ctx = ngx_pcalloc(cf->pool, sizeof(ngx_filter_conf_ctx_t));
++    if (ctx == NULL) {
++        return NGX_CONF_ERROR;
++    }
++
++    *(ngx_filter_conf_ctx_t **) conf = ctx;
++
++    /* count the number of the tcp modules and set up their indices */
++
++    ngx_filter_max_module = 0;
++    for (m = 0; ngx_modules[m]; m++) {
++        if (ngx_modules[m]->type != NGX_FILTER_MODULE) {
++            continue;
++        }
++
++        ngx_modules[m]->ctx_index = ngx_filter_max_module++;
++    }
++
++
++    /* the tcp main_conf context, it is the same in the all tcp contexts */
++
++    ctx->main_conf = ngx_pcalloc(cf->pool,
++                                 sizeof(void *) * ngx_filter_max_module);
++    if (ctx->main_conf == NULL) {
++        return NGX_CONF_ERROR;
++    }
++
++
++    /*
++     * the tcp null srv_conf context, it is used to merge
++     * the server{}s' srv_conf's
++     */
++
++    ctx->srv_conf = ngx_pcalloc(cf->pool, sizeof(void *) * ngx_filter_max_module);
++    if (ctx->srv_conf == NULL) {
++        return NGX_CONF_ERROR;
++    }
++
++
++    /*
++     * create the main_conf's, the null srv_conf's, and the null loc_conf's
++     * of the all filter modules
++     */
++
++    for (m = 0; ngx_modules[m]; m++) {
++        if (ngx_modules[m]->type != NGX_FILTER_MODULE) {
++            continue;
++        }
++
++        module = ngx_modules[m]->ctx;
++        mi = ngx_modules[m]->ctx_index;
++
++        if (module->create_main_conf) {
++            ctx->main_conf[mi] = module->create_main_conf(cf);
++            if (ctx->main_conf[mi] == NULL) {
++                return NGX_CONF_ERROR;
++            }
++        }
++
++        if (module->create_srv_conf) {
++            ctx->srv_conf[mi] = module->create_srv_conf(cf);
++            if (ctx->srv_conf[mi] == NULL) {
++                return NGX_CONF_ERROR;
++            }
++        }
++    }
++
++
++    /* parse inside the filter{} block */
++
++    pcf = *cf;
++    cf->ctx = ctx;
++
++    cf->module_type = NGX_FILTER_MODULE;
++    cf->cmd_type = NGX_FILTER_MAIN_CONF;
++    rv = ngx_conf_parse(cf, NULL);
++
++    if (rv != NGX_CONF_OK) {
++        *cf = pcf;
++        return rv;
++    }
++
++
++    /* init tcp{} main_conf's, merge the server{}s' srv_conf's */
++
++    cmcf = ctx->main_conf[ngx_filter_core_module.ctx_index];
++    cscfp = cmcf->servers.elts;
++
++    for (m = 0; ngx_modules[m]; m++) {
++        if (ngx_modules[m]->type != NGX_FILTER_MODULE) {
++            continue;
++        }
++
++        module = ngx_modules[m]->ctx;
++        mi = ngx_modules[m]->ctx_index;
++
++        /* init tcp{} main_conf's */
++
++        cf->ctx = ctx;
++
++        if (module->init_main_conf) {
++            rv = module->init_main_conf(cf, ctx->main_conf[mi]);
++            if (rv != NGX_CONF_OK) {
++                *cf = pcf;
++                return rv;
++            }
++        }
++
++        for (s = 0; s < cmcf->servers.nelts; s++) {
++
++            /* merge the server{}s' srv_conf's */
++
++            cf->ctx = cscfp[s]->ctx;
++
++            if (module->merge_srv_conf) {
++                rv = module->merge_srv_conf(cf, ctx->srv_conf[mi],
++                                            cscfp[s]->ctx->srv_conf[mi]);
++                if (rv != NGX_CONF_OK) {
++                    *cf = pcf;
++                    return rv;
++                }
++            }
++        }
++    }
++
++    *cf = pcf;
++
++    if (ngx_array_init(&ports, cf->temp_pool, 4, sizeof(ngx_filter_conf_port_t))
++        != NGX_OK)
++    {
++        return NGX_CONF_ERROR;
++    }
++
++    listen = cmcf->listen.elts;
++
++    for (i = 0; i < cmcf->listen.nelts; i++) {
++        if (ngx_filter_add_ports(cf, &ports, &listen[i]) != NGX_OK) {
++            return NGX_CONF_ERROR;
++        }
++
++    }
++
++    return ngx_filter_optimize_servers(cf, cmcf, &ports);
++}
++
++
++static ngx_int_t
++ngx_filter_add_ports(ngx_conf_t *cf, ngx_array_t *ports, ngx_filter_listen_t *listen)
++{
++    in_port_t              p;
++    ngx_uint_t             i;
++    struct sockaddr       *sa;
++    struct sockaddr_in    *sin;
++    ngx_filter_conf_port_t   *port;
++    ngx_filter_conf_addr_t   *addr;
++#if (NGX_HAVE_INET6)
++    struct sockaddr_in6   *sin6;
++#endif
++
++    sa = (struct sockaddr *) &listen->sockaddr;
++
++    switch (sa->sa_family) {
++
++#if (NGX_HAVE_INET6)
++    case AF_INET6:
++        sin6 = (struct sockaddr_in6 *) sa;
++        p = sin6->sin6_port;
++        break;
++#endif
++
++    default: /* AF_INET */
++        sin = (struct sockaddr_in *) sa;
++        p = sin->sin_port;
++        break;
++    }
++
++    port = ports->elts;
++    for (i = 0; i < ports->nelts; i++) {
++        if (p == port[i].port && sa->sa_family == port[i].family) {
++
++            /* a port is already in the port list */
++
++            port = &port[i];
++            goto found;
++        }
++    }
++
++    /* add a port to the port list */
++
++    port = ngx_array_push(ports);
++    if (port == NULL) {
++        return NGX_ERROR;
++    }
++
++    port->family = sa->sa_family;
++    port->port = p;
++
++    if (ngx_array_init(&port->addrs, cf->temp_pool, 2,
++                       sizeof(ngx_filter_conf_addr_t))
++        != NGX_OK)
++    {
++        return NGX_ERROR;
++    }
++
++found:
++
++    addr = ngx_array_push(&port->addrs);
++    if (addr == NULL) {
++        return NGX_ERROR;
++    }
++
++    ngx_memzero(addr, sizeof(ngx_filter_conf_addr_t));
++
++    addr->sockaddr = (struct sockaddr *) &listen->sockaddr;
++    addr->socklen = listen->socklen;
++    addr->ctx = listen->ctx;
++    addr->bind = listen->bind;
++    addr->wildcard = listen->wildcard;
++    if (listen->default_port) {
++        addr->default_ctx = listen->ctx;
++    }
++#if (NGX_FILTER_SSL)
++    addr->ssl = listen->ssl;
++#endif
++#if (NGX_HAVE_INET6 && defined IPV6_V6ONLY)
++    addr->ipv6only = listen->ipv6only;
++#endif
++#if (NGX_HAVE_TPROXY)
++	addr->tproxy= listen->tproxy;
++#endif
++
++
++
++    return NGX_OK;
++}
++
++
++
++static char *
++ngx_filter_optimize_servers(ngx_conf_t *cf, ngx_filter_core_main_conf_t *cmcf,
++    ngx_array_t *ports)
++{
++    ngx_uint_t             i, p, last, bind_wildcard;
++    ngx_listening_t       *ls;
++    ngx_filter_port_t        *mport;
++    ngx_filter_conf_port_t   *port;
++    ngx_filter_conf_addr_t   *addr;
++
++    port = ports->elts;
++    for (p = 0; p < ports->nelts; p++) {
++
++        ngx_sort(port[p].addrs.elts, (size_t) port[p].addrs.nelts,
++                 sizeof(ngx_filter_conf_addr_t), ngx_filter_cmp_conf_addrs);
++
++        addr = port[p].addrs.elts;
++        last = port[p].addrs.nelts;
++
++        /*
++         * if there is the binding to the "*:port" then we need to bind()
++         * to the "*:port" only and ignore the other bindings
++         */
++
++        if (addr[last - 1].wildcard) {
++            addr[last - 1].bind = 1;
++            bind_wildcard = 1;
++
++        } else {
++            bind_wildcard = 0;
++        }
++
++        i = 0;
++
++        while (i < last) {
++
++            if (bind_wildcard && !addr[i].bind) {
++                i++;
++                continue;
++            }
++
++            ls = ngx_create_listening(cf, addr[i].sockaddr, addr[i].socklen);
++            if (ls == NULL) {
++                return NGX_CONF_ERROR;
++            }
++
++            ls->addr_ntop = 1;
++            ls->handler = ngx_filter_init_connection;
++            ls->pool_size = 256;
++
++            /* TODO: error_log directive */
++            ls->logp = &cf->cycle->new_log;
++            ls->log.data = &ls->addr_text;
++            ls->log.handler = ngx_accept_log_error;
++
++#if (NGX_HAVE_INET6 && defined IPV6_V6ONLY)
++            ls->ipv6only = addr[i].ipv6only;
++#endif
++
++#if (NGX_HAVE_TPROXY)
++			ls->tproxy = addr[i].tproxy;
++#endif
++
++
++            mport = ngx_palloc(cf->pool, sizeof(ngx_filter_port_t));
++            if (mport == NULL) {
++                return NGX_CONF_ERROR;
++            }
++
++            ls->servers = mport;
++
++            if (i == last - 1) {
++                mport->naddrs = last;
++
++            } else {
++                mport->naddrs = 1;
++                i = 0;
++            }
++
++            switch (ls->sockaddr->sa_family) {
++#if (NGX_HAVE_INET6)
++            case AF_INET6:
++                if (ngx_filter_add_addrs6(cf, mport, addr) != NGX_OK) {
++                    return NGX_CONF_ERROR;
++                }
++                break;
++#endif
++            default: /* AF_INET */
++                if (ngx_filter_add_addrs(cf, mport, addr) != NGX_OK) {
++                    return NGX_CONF_ERROR;
++                }
++                break;
++            }
++
++
++            addr++;
++            last--;
++        }
++    }
++
++    return NGX_CONF_OK;
++}
++
++
++static ngx_int_t
++ngx_filter_add_addrs(ngx_conf_t *cf, ngx_filter_port_t *mport,
++    ngx_filter_conf_addr_t *addr)
++{
++    u_char              *p;
++    size_t               len;
++    ngx_uint_t           i, j;
++    ngx_filter_in_addr_t   *addrs;
++    struct sockaddr_in  *sin, *sin_b;
++    u_char               buf[NGX_SOCKADDR_STRLEN];
++
++    mport->addrs = ngx_pcalloc(cf->pool,
++                               mport->naddrs * sizeof(ngx_filter_in_addr_t));
++    if (mport->addrs == NULL) {
++        return NGX_ERROR;
++    }
++
++    addrs = mport->addrs;
++
++    for (i = 0; i < mport->naddrs; i++) {
++
++        sin = (struct sockaddr_in *) addr[i].sockaddr;
++        addrs[i].addr = sin->sin_addr.s_addr;
++
++        addrs[i].conf.ctx = addr[i].ctx;
++
++        for (j = 0; j < mport->naddrs; j++) {
++            sin_b = (struct sockaddr_in *) addr[j].sockaddr;
++            if ((sin->sin_addr.s_addr == sin_b->sin_addr.s_addr) && addr[j].default_ctx) {
++                addrs[i].conf.default_ctx = addr[j].default_ctx;
++            }
++        }
++
++#if (NGX_FILTER_SSL)
++        addrs[i].conf.ssl = addr[i].ssl;
++#endif
++
++#if defined(nginx_version) && nginx_version >= 1005003
++        len = ngx_sock_ntop(addr[i].sockaddr, addr[i].socklen, buf, NGX_SOCKADDR_STRLEN, 1);
++#else
++        len = ngx_sock_ntop(addr[i].sockaddr, buf, NGX_SOCKADDR_STRLEN, 1);
++#endif
++
++        p = ngx_pnalloc(cf->pool, len);
++        if (p == NULL) {
++            return NGX_ERROR;
++        }
++
++        ngx_memcpy(p, buf, len);
++
++        addrs[i].conf.addr_text.len = len;
++        addrs[i].conf.addr_text.data = p;
++    }
++
++    return NGX_OK;
++}
++
++
++#if (NGX_HAVE_INET6)
++
++static ngx_int_t
++ngx_filter_add_addrs6(ngx_conf_t *cf, ngx_filter_port_t *mport,
++    ngx_filter_conf_addr_t *addr)
++{
++    u_char               *p;
++    size_t                len;
++    ngx_uint_t            i, j;
++    ngx_filter_in6_addr_t   *addrs6;
++    struct sockaddr_in6  *sin6, *sin6_b;
++    u_char                buf[NGX_SOCKADDR_STRLEN];
++
++    mport->addrs = ngx_pcalloc(cf->pool,
++                               mport->naddrs * sizeof(ngx_filter_in6_addr_t));
++    if (mport->addrs == NULL) {
++        return NGX_ERROR;
++    }
++
++    addrs6 = mport->addrs;
++
++    for (i = 0; i < mport->naddrs; i++) {
++
++        sin6 = (struct sockaddr_in6 *) addr[i].sockaddr;
++        addrs6[i].addr6 = sin6->sin6_addr;
++
++        addrs6[i].conf.ctx = addr[i].ctx;
++
++        for (j = 0; j < mport->naddrs; j++) {
++            sin6_b = (struct sockaddr_in6 *) addr[j].sockaddr;
++
++            if ((ngx_memcmp(&sin6->sin6_addr, &sin6_b->sin6_addr, 16) == 0) && 
++                    addr[j].default_ctx) {
++                addrs6[i].conf.default_ctx = addr[j].default_ctx;
++            }
++        }
++
++#if (NGX_FILTER_SSL)
++        addrs6[i].conf.ssl = addr[i].ssl;
++#endif
++
++#if defined(nginx_version) && nginx_version >= 1005003
++        len = ngx_sock_ntop(addr[i].sockaddr, addr[i].socklen, buf, NGX_SOCKADDR_STRLEN, 1);
++#else
++        len = ngx_sock_ntop(addr[i].sockaddr, buf, NGX_SOCKADDR_STRLEN, 1);
++#endif
++
++        p = ngx_pnalloc(cf->pool, len);
++        if (p == NULL) {
++            return NGX_ERROR;
++        }
++
++        ngx_memcpy(p, buf, len);
++
++        addrs6[i].conf.addr_text.len = len;
++        addrs6[i].conf.addr_text.data = p;
++    }
++
++    return NGX_OK;
++}
++
++#endif
++
++
++static ngx_int_t
++ngx_filter_cmp_conf_addrs(const void *one, const void *two)
++{
++    ngx_filter_conf_addr_t  *first, *second;
++
++    first = (ngx_filter_conf_addr_t *) one;
++    second = (ngx_filter_conf_addr_t *) two;
++
++    if (first->wildcard) {
++        /* a wildcard must be the last resort, shift it to the end */
++        return 1;
++    }
++
++    if (first->bind && !second->bind) {
++        /* shift explicit bind()ed addresses to the start */
++        return -1;
++    }
++
++    if (!first->bind && second->bind) {
++        /* shift explicit bind()ed addresses to the start */
++        return 1;
++    }
++
++    /* do not sort by default */
++
++    return 0;
++}
+diff --git a/src/filter/ngx_filter.h b/src/filter/ngx_filter.h
+new file mode 100755
+index 0000000..6685d4a
+--- /dev/null
++++ b/src/filter/ngx_filter.h
+@@ -0,0 +1,283 @@
++#ifndef _NGX_FILTER_H_INCLUDED_
++#define _NGX_FILTER_H_INCLUDED_
++/*
++ * author : yubo@xiaomi.com
++ */
++
++#include <nginx.h>
++#include <ngx_config.h>
++#include <ngx_core.h>
++#include <ngx_event.h>
++#include <ngx_event_connect.h>
++
++
++typedef struct ngx_filter_protocol_s  ngx_filter_protocol_t;
++typedef struct ngx_filter_cleanup_s  ngx_filter_cleanup_t;
++
++typedef struct ngx_filter_core_srv_conf_s ngx_filter_core_srv_conf_t;
++
++
++typedef struct check_conf_s check_conf_t;
++
++/* make nginx-0.8.22+ happy */
++#if defined(nginx_version) && nginx_version >= 8022
++typedef ngx_addr_t ngx_peer_addr_t; 
++#endif
++
++#include <ngx_filter_session.h>
++
++
++typedef struct {
++    void                  **main_conf;
++    void                  **srv_conf;
++} ngx_filter_conf_ctx_t;
++
++
++typedef struct {
++    u_char                  sockaddr[NGX_SOCKADDRLEN];
++    socklen_t               socklen;
++
++    /* server ctx */
++    ngx_filter_conf_ctx_t     *ctx;
++
++    unsigned                default_port:1;
++    unsigned                bind:1;
++    unsigned                wildcard:1;
++#if (NGX_FILTER_SSL)
++    unsigned                ssl:1;
++#endif
++#if (NGX_HAVE_INET6 && defined IPV6_V6ONLY)
++    unsigned                ipv6only:2;
++#endif
++#if (NGX_HAVE_TPROXY)
++		unsigned		    tproxy:1;
++#endif
++
++    ngx_filter_core_srv_conf_t *conf;
++
++
++} ngx_filter_listen_t;
++
++
++typedef struct {
++    ngx_str_t                name;
++} ngx_filter_server_name_t;
++
++
++typedef struct {
++    ngx_uint_t               hash;
++    ngx_str_t                name;
++    ngx_filter_listen_t        *listen;
++    ngx_filter_conf_ctx_t      *ctx;
++
++	
++} ngx_filter_virtual_server_t;
++
++
++
++
++typedef struct {
++    ngx_str_t                name;
++} ngx_filter_core_loc_t;
++
++
++typedef struct {
++    ngx_filter_conf_ctx_t      *ctx;
++    ngx_filter_conf_ctx_t      *default_ctx;
++    ngx_str_t                addr_text;
++#if (NGX_FILTER_SSL)
++    ngx_uint_t               ssl;    /* unsigned   ssl:1; */
++#endif
++} ngx_filter_addr_conf_t;
++
++typedef struct {
++    in_addr_t                addr;
++    ngx_filter_addr_conf_t      conf;
++} ngx_filter_in_addr_t;
++
++
++#if (NGX_HAVE_INET6)
++
++typedef struct {
++    struct in6_addr          addr6;
++    ngx_filter_addr_conf_t      conf;
++} ngx_filter_in6_addr_t;
++
++#endif
++
++
++typedef struct {
++    /* ngx_filter_in_addr_t or ngx_filter_in6_addr_t */
++    void                    *addrs;
++    ngx_uint_t               naddrs;
++    ngx_listening_t         *default_ls;    
++#if (NGX_PCRE)
++    ngx_array_t             *regex;
++#endif
++} ngx_filter_port_t;
++
++typedef struct {
++    ngx_regex_t     *regex;
++    ngx_listening_t *ls;
++	ngx_shm_zone_t  *preload_shm_zone;	
++	unsigned		preload:1;
++} ngx_filter_regex_elt_t;
++
++
++typedef struct {
++    int                           family;
++    in_port_t                     port;
++    ngx_array_t                   addrs;       /* array of ngx_filter_conf_addr_t */
++} ngx_filter_conf_port_t;
++
++
++typedef struct {
++    struct sockaddr         *sockaddr;
++    socklen_t                socklen;
++
++    ngx_filter_conf_ctx_t      *ctx;
++    ngx_filter_conf_ctx_t      *default_ctx;
++
++    unsigned                 bind:1;
++    unsigned                 wildcard:1;
++#if (NGX_FILTER_SSL)
++    unsigned                 ssl:1;
++#endif
++#if (NGX_HAVE_INET6 && defined IPV6_V6ONLY)
++    unsigned                 ipv6only:2;
++#endif
++#if (NGX_HAVE_TPROXY)
++    unsigned                 tproxy:1;
++#endif
++} ngx_filter_conf_addr_t;
++
++typedef struct {
++    in_addr_t                mask;
++    in_addr_t                addr;
++    ngx_uint_t               deny;      /* unsigned  deny:1; */
++} ngx_filter_access_rule_t;
++
++typedef struct {
++    ngx_array_t              servers;         /* ngx_filter_core_srv_conf_t */
++    ngx_array_t              listen;          /* ngx_filter_listen_t */
++    ngx_array_t              virtual_servers; /* ngx_filter_virtual_server_t */
++    ngx_array_t              regexs;          /* ngx_filter_regex_t */
++} ngx_filter_core_main_conf_t;
++
++typedef struct {
++    ngx_open_file_t         *file;
++    time_t                   disk_full_time;
++    time_t                   error_log_time;
++} ngx_filter_log_t;
++
++typedef struct {
++    u_char                  *start;
++    u_char                  *pos;
++    u_char                  *last;
++} ngx_filter_log_buf_t;
++
++typedef struct {
++    ngx_array_t             *logs;       /* array of ngx_filter_log_t */
++
++    ngx_open_file_cache_t   *open_file_cache;
++    time_t                   open_file_cache_valid;
++    ngx_uint_t               open_file_cache_min_uses;
++
++    ngx_uint_t               off;        /* unsigned  off:1 */
++} ngx_filter_log_srv_conf_t;
++
++
++#define NGX_FILTER_GENERIC_PROTOCOL    0
++#define NGX_FILTER_WEBSOCKET_PROTOCOL  1
++
++
++
++struct ngx_filter_core_srv_conf_s {
++
++	ngx_array_t 			*regex;
++	ngx_listening_t         *default_ls;
++
++    size_t                   buffer_size;
++
++    ngx_msec_t               timeout;
++	u_char					*file_name;
++    ngx_int_t                line;
++
++
++    ngx_resolver_t          *resolver;
++
++
++    ngx_filter_log_srv_conf_t  *access_log;
++
++    /* server ctx */
++    ngx_filter_conf_ctx_t      *ctx;
++};
++
++
++typedef struct {
++    ngx_str_t              *client;
++    ngx_filter_session_t      *session;
++} ngx_filter_log_ctx_t;
++
++
++typedef void (*ngx_filter_init_session_pt)(ngx_filter_session_t *s);
++typedef void (*ngx_filter_init_protocol_pt)(ngx_event_t *rev);
++typedef void (*ngx_filter_parse_protocol_pt)(ngx_event_t *rev);
++
++
++struct ngx_filter_protocol_s {
++    ngx_str_t                   name;
++    in_port_t                   port[4];
++    ngx_uint_t                  type;
++
++    ngx_filter_init_session_pt     init_session;
++    ngx_filter_init_protocol_pt    init_protocol;
++    ngx_filter_parse_protocol_pt   parse_protocol;
++
++    ngx_str_t                   internal_server_error;
++};
++
++
++typedef struct {
++    ngx_filter_protocol_t         *protocol;
++
++    void                       *(*create_main_conf)(ngx_conf_t *cf);
++    char                       *(*init_main_conf)(ngx_conf_t *cf, void *conf);
++
++    void                       *(*create_srv_conf)(ngx_conf_t *cf);
++    char                       *(*merge_srv_conf)(ngx_conf_t *cf, void *prev,
++                                      void *conf);
++} ngx_filter_module_t;
++
++
++#define NGX_FILTER_MODULE         0x00501008     /* "FILTER" */
++
++#define NGX_FILTER_MAIN_CONF      0x02000000
++#define NGX_FILTER_SRV_CONF       0x04000000
++#define NGX_FILTER_LOC_CONF       0x08000000
++#define NGX_FILTER_UPS_CONF       0x10000000
++
++
++#define NGX_FILTER_MAIN_CONF_OFFSET  offsetof(ngx_filter_conf_ctx_t, main_conf)
++#define NGX_FILTER_SRV_CONF_OFFSET   offsetof(ngx_filter_conf_ctx_t, srv_conf)
++
++
++#define ngx_filter_get_module_ctx(s, module)     (s)->ctx[module.ctx_index]
++#define ngx_filter_set_ctx(s, c, module)         s->ctx[module.ctx_index] = c;
++#define ngx_filter_delete_ctx(s, module)         s->ctx[module.ctx_index] = NULL;
++
++
++#define ngx_filter_get_module_main_conf(s, module)                             \
++    (s)->main_conf[module.ctx_index]
++#define ngx_filter_get_module_srv_conf(s, module)  (s)->srv_conf[module.ctx_index]
++
++#define ngx_filter_conf_get_module_main_conf(cf, module)                       \
++    ((ngx_filter_conf_ctx_t *) cf->ctx)->main_conf[module.ctx_index]
++#define ngx_filter_conf_get_module_srv_conf(cf, module)                        \
++    ((ngx_filter_conf_ctx_t *) cf->ctx)->srv_conf[module.ctx_index]
++
++
++extern ngx_uint_t    ngx_filter_max_module;
++extern ngx_module_t  ngx_filter_core_module;
++
++#endif /* _NGX_FILTER_H_INCLUDED_ */
+diff --git a/src/filter/ngx_filter_core_module.c b/src/filter/ngx_filter_core_module.c
+new file mode 100755
+index 0000000..31193fb
+--- /dev/null
++++ b/src/filter/ngx_filter_core_module.c
+@@ -0,0 +1,755 @@
++/*
++ * author : yubo@xiaomi.com
++ */
++#include <ngx_config.h>
++#include <ngx_core.h>
++#include <ngx_event.h>
++#include <ngx_filter.h>
++#include <nginx.h>
++
++
++static void *ngx_filter_core_create_main_conf(ngx_conf_t *cf);
++static void *ngx_filter_core_create_srv_conf(ngx_conf_t *cf);
++static char *ngx_filter_core_merge_srv_conf(ngx_conf_t *cf, void *parent,
++    void *child);
++static char *ngx_filter_core_server(ngx_conf_t *cf, ngx_command_t *cmd,
++    void *conf);
++static char *ngx_filter_core_listen(ngx_conf_t *cf, ngx_command_t *cmd,
++    void *conf);
++static char *ngx_filter_core_redirect(ngx_conf_t *cf, ngx_command_t *cmd,
++    void *conf);
++static ngx_listening_t *ngx_filter_find_ls(ngx_conf_t *cf, in_port_t port);
++static char *ngx_filter_log_set_access_log(ngx_conf_t *cf, ngx_command_t *cmd,
++    void *conf);
++
++extern ngx_module_t  ngx_http_preload_cache_module;
++
++static u_char preload_pattern[] = "^(GET)\\s+(\\S+)\\s+(.*\\R)+Host:(\\s+)?([\\S]+)\\R";
++
++static ngx_command_t  ngx_filter_core_commands[] = {
++
++    { ngx_string("server"),
++      NGX_FILTER_MAIN_CONF|NGX_CONF_BLOCK|NGX_CONF_MULTI|NGX_CONF_NOARGS,
++      ngx_filter_core_server,
++      0,
++      0,
++      NULL },
++
++    { ngx_string("listen"),
++      NGX_FILTER_SRV_CONF|NGX_CONF_1MORE,
++      ngx_filter_core_listen,
++      NGX_FILTER_SRV_CONF_OFFSET,
++      0,
++      NULL },
++    { ngx_string("redirect"),
++      NGX_FILTER_SRV_CONF|NGX_CONF_TAKE23,
++      ngx_filter_core_redirect,
++      NGX_FILTER_SRV_CONF_OFFSET,
++      0,
++      NULL },
++    { ngx_string("timeout"),
++      NGX_FILTER_MAIN_CONF|NGX_FILTER_SRV_CONF|NGX_CONF_TAKE1,
++      ngx_conf_set_msec_slot,
++      NGX_FILTER_SRV_CONF_OFFSET,
++      offsetof(ngx_filter_core_srv_conf_t, timeout),
++      NULL },
++    { ngx_string("access_log"),
++      NGX_FILTER_MAIN_CONF|NGX_FILTER_SRV_CONF|NGX_CONF_TAKE12,
++      ngx_filter_log_set_access_log,
++      NGX_FILTER_SRV_CONF_OFFSET,
++      0,
++      NULL },
++	{ ngx_string("proxy_buffer"),
++	  NGX_FILTER_MAIN_CONF|NGX_FILTER_SRV_CONF|NGX_CONF_TAKE1,
++	  ngx_conf_set_size_slot,
++	  NGX_FILTER_SRV_CONF_OFFSET,
++	  offsetof(ngx_filter_core_srv_conf_t, buffer_size),
++	  NULL },
++
++    ngx_null_command
++};
++
++
++static ngx_filter_module_t  ngx_filter_core_module_ctx = {
++    NULL,                                  /* protocol */
++
++    ngx_filter_core_create_main_conf,         /* create main configuration */
++    NULL,                                  /* init main configuration */
++
++    ngx_filter_core_create_srv_conf,          /* create server configuration */
++    ngx_filter_core_merge_srv_conf            /* merge server configuration */
++};
++
++
++ngx_module_t  ngx_filter_core_module = {
++    NGX_MODULE_V1,
++    &ngx_filter_core_module_ctx,              /* module context */
++    ngx_filter_core_commands,                 /* module directives */
++    NGX_FILTER_MODULE,                        /* module type */
++    NULL,                                  /* init master */
++    NULL,                                  /* init module */
++    NULL,                                  /* init process */
++    NULL,                                  /* init thread */
++    NULL,                                  /* exit thread */
++    NULL,                                  /* exit process */
++    NULL,                                  /* exit master */
++    NGX_MODULE_V1_PADDING
++};
++
++
++static ngx_str_t  ngx_filter_access_log = ngx_string("logs/filter_access.log");
++
++
++static void *
++ngx_filter_core_create_main_conf(ngx_conf_t *cf) 
++{
++    ngx_filter_core_main_conf_t  *cmcf;
++
++    cmcf = ngx_pcalloc(cf->pool, sizeof(ngx_filter_core_main_conf_t));
++    if (cmcf == NULL) {
++        return NULL;
++    }
++
++    if (ngx_array_init(&cmcf->servers, cf->pool, 4,
++                       sizeof(ngx_filter_core_srv_conf_t *))
++        != NGX_OK)
++    {
++        return NULL;
++    }
++
++    if (ngx_array_init(&cmcf->listen, cf->pool, 4, sizeof(ngx_filter_listen_t))
++        != NGX_OK)
++    {
++        return NULL;
++    }
++
++    if (ngx_array_init(&cmcf->virtual_servers, cf->pool, 4, 
++                       sizeof(ngx_filter_virtual_server_t)) != NGX_OK)
++    {
++        return NULL;
++    }
++
++
++
++    return cmcf;
++}
++
++
++static void *
++ngx_filter_core_create_srv_conf(ngx_conf_t *cf) 
++{
++    ngx_filter_core_srv_conf_t  *cscf;
++    ngx_filter_log_srv_conf_t   *lscf;
++
++    cscf = ngx_pcalloc(cf->pool, sizeof(ngx_filter_core_srv_conf_t));
++    if (cscf == NULL) {
++        return NULL;
++    }
++
++    /*
++     * set by ngx_pcalloc():
++     *
++     *     cscf->protocol = NULL;
++     */
++
++	cscf->regex = NGX_CONF_UNSET_PTR;
++	cscf->default_ls = NGX_CONF_UNSET_PTR;
++
++
++    cscf->timeout = NGX_CONF_UNSET_MSEC;
++    cscf->buffer_size = NGX_CONF_UNSET_SIZE;
++
++    cscf->file_name = cf->conf_file->file.name.data;
++    cscf->line = cf->conf_file->line;
++
++    lscf = cscf->access_log = ngx_pcalloc(cf->pool, 
++                                          sizeof(ngx_filter_log_srv_conf_t));
++    if (lscf == NULL) {
++        return NULL;
++    }
++
++    /*
++     * set by ngx_pcalloc():
++     *
++     *     lscf->logs = NULL;
++     */
++
++    lscf->open_file_cache = NGX_CONF_UNSET_PTR;
++
++    return cscf;
++}
++
++
++static char *
++ngx_filter_core_merge_srv_conf(ngx_conf_t *cf, void *parent, void *child) 
++{
++    ngx_filter_log_t           *log;
++    ngx_filter_core_srv_conf_t *prev = parent;
++    ngx_filter_core_srv_conf_t *conf = child;
++    ngx_filter_log_srv_conf_t  *plscf = prev->access_log;
++    ngx_filter_log_srv_conf_t  *lscf = conf->access_log;
++
++    ngx_conf_merge_msec_value(conf->timeout, prev->timeout, 60000);
++
++
++
++    ngx_conf_merge_ptr_value(conf->resolver, prev->resolver, NULL);
++
++
++
++    if (lscf->open_file_cache == NGX_CONF_UNSET_PTR) {
++
++        lscf->open_file_cache = plscf->open_file_cache;
++        lscf->open_file_cache_valid = plscf->open_file_cache_valid;
++        lscf->open_file_cache_min_uses = plscf->open_file_cache_min_uses;
++
++        if (lscf->open_file_cache == NGX_CONF_UNSET_PTR) {
++            lscf->open_file_cache = NULL;
++        }
++    }
++
++    if (lscf->logs || lscf->off) {
++        return NGX_CONF_OK;
++    }
++
++    lscf->logs = plscf->logs;
++    lscf->off = plscf->off;
++
++    if (lscf->logs || lscf->off) {
++        return NGX_CONF_OK;
++    }
++
++    lscf->logs = ngx_array_create(cf->pool, 2, sizeof(ngx_filter_log_t));
++    if (lscf->logs == NULL) {
++        return NGX_CONF_ERROR;
++    }
++
++    log = ngx_array_push(lscf->logs);
++    if (log == NULL) {
++        return NGX_CONF_ERROR;
++    }
++
++    log->file = ngx_conf_open_file(cf->cycle, &ngx_filter_access_log);
++    if (log->file == NULL) {
++        return NGX_CONF_ERROR;
++    }
++
++    log->disk_full_time = 0;
++    log->error_log_time = 0;
++
++    return NGX_CONF_OK;
++}
++
++
++static char *
++ngx_filter_core_server(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
++{
++    char                       *rv;
++    void                       *mconf;
++    ngx_uint_t                  m;
++    ngx_conf_t                  pcf;
++    ngx_filter_module_t           *module;
++    ngx_filter_conf_ctx_t         *ctx, *filter_ctx;
++    ngx_filter_core_srv_conf_t    *cscf, **cscfp;
++    ngx_filter_core_main_conf_t   *cmcf;
++
++    ctx = ngx_pcalloc(cf->pool, sizeof(ngx_filter_conf_ctx_t));
++    if (ctx == NULL) {
++        return NGX_CONF_ERROR;
++    }
++
++    filter_ctx = cf->ctx;
++    ctx->main_conf = filter_ctx->main_conf;
++
++    /* the server{}'s srv_conf */
++
++    ctx->srv_conf = ngx_pcalloc(cf->pool, sizeof(void *) * ngx_filter_max_module);
++    if (ctx->srv_conf == NULL) {
++        return NGX_CONF_ERROR;
++    }
++
++    for (m = 0; ngx_modules[m]; m++) {
++        if (ngx_modules[m]->type != NGX_FILTER_MODULE) {
++            continue;
++        }
++
++        module = ngx_modules[m]->ctx;
++
++        if (module->create_srv_conf) {
++            mconf = module->create_srv_conf(cf);
++            if (mconf == NULL) {
++                return NGX_CONF_ERROR;
++            }
++
++            ctx->srv_conf[ngx_modules[m]->ctx_index] = mconf;
++        }
++    }
++
++    /* the server configuration context */
++
++    cscf = ctx->srv_conf[ngx_filter_core_module.ctx_index];
++    cscf->ctx = ctx;
++
++    cmcf = ctx->main_conf[ngx_filter_core_module.ctx_index];
++
++    cscfp = ngx_array_push(&cmcf->servers);
++    if (cscfp == NULL) {
++        return NGX_CONF_ERROR;
++    }
++
++    *cscfp = cscf;
++
++    /* parse inside server{} */
++
++    pcf = *cf;
++    cf->ctx = ctx;
++    cf->cmd_type = NGX_FILTER_SRV_CONF;
++
++    rv = ngx_conf_parse(cf, NULL);
++
++    *cf = pcf;
++
++    return rv;
++}
++
++
++static char *
++ngx_filter_core_listen(ngx_conf_t *cf, ngx_command_t *cmd, void *conf) 
++{
++    size_t                      len, off;
++    in_port_t                   port;
++    ngx_str_t                  *value;
++    ngx_url_t                   u;
++    ngx_uint_t                  i;
++    struct sockaddr            *sa;
++    ngx_filter_listen_t       *ls;
++    struct sockaddr_in         *sin;
++    ngx_filter_core_main_conf_t   *cmcf;
++#if (NGX_HAVE_INET6)
++    struct sockaddr_in6        *sin6;
++#endif
++
++    value = cf->args->elts;
++
++    ngx_memzero(&u, sizeof(ngx_url_t));
++
++    u.url = value[1];
++    u.listen = 1;
++
++    if (ngx_parse_url(cf->pool, &u) != NGX_OK) {
++        if (u.err) {
++            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
++                               "%s in \"%V\" of the \"listen\" directive",
++                               u.err, &u.url);
++        }
++
++        return NGX_CONF_ERROR;
++    }
++
++    cmcf = ngx_filter_conf_get_module_main_conf(cf, ngx_filter_core_module);
++
++    ls = cmcf->listen.elts;
++
++    for (i = 0; i < cmcf->listen.nelts; i++) {
++
++        sa = (struct sockaddr *) ls[i].sockaddr;
++
++        if (sa->sa_family != u.family) {
++            continue;
++        }
++
++        switch (sa->sa_family) {
++
++#if (NGX_HAVE_INET6)
++            case AF_INET6:
++                off = offsetof(struct sockaddr_in6, sin6_addr);
++                len = 16;
++                sin6 = (struct sockaddr_in6 *) sa;
++                port = sin6->sin6_port;
++                break;
++#endif
++
++            default: /* AF_INET */
++                off = offsetof(struct sockaddr_in, sin_addr);
++                len = 4;
++                sin = (struct sockaddr_in *) sa;
++                port = sin->sin_port;
++                break;
++        }
++
++        if (ngx_memcmp(ls[i].sockaddr + off, u.sockaddr + off, len) != 0) {
++            continue;
++        }
++
++        if (port != u.port) {
++            continue;
++        }
++
++        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
++                "duplicate \"%V\" address and port pair", &u.url);
++        return NGX_CONF_ERROR;
++    }
++
++    ls = ngx_array_push(&cmcf->listen);
++    if (ls == NULL) {
++        return NGX_CONF_ERROR;
++    }
++
++    ngx_memzero(ls, sizeof(ngx_filter_listen_t));
++
++    ngx_memcpy(ls->sockaddr, u.sockaddr, u.socklen);
++
++    ls->socklen = u.socklen;
++    ls->wildcard = u.wildcard;
++    ls->ctx = cf->ctx;
++    ls->conf = conf;
++
++    for (i = 2; i < cf->args->nelts; i++) {
++		if (ngx_strcmp(value[i].data, "tproxy") == 0) {
++#if (NGX_HAVE_TPROXY)
++			ls->tproxy = 1; 
++#else
++			ngx_conf_log_error(NGX_LOG_WARN, cf, 0,
++			"TPROXY support is not enabled, ignoring option \"tproxy\" in %V",
++			&value[i]);
++#endif
++			continue;
++		}
++
++
++        if (ngx_strcmp(value[i].data, "bind") == 0) {
++            ls->bind = 1;
++            continue;
++        }
++
++        if (ngx_strcmp(value[i].data, "default") == 0) {
++            ls->default_port = 1;
++            continue;
++        }
++
++        if (ngx_strncmp(value[i].data, "ipv6only=o", 10) == 0) {
++#if (NGX_HAVE_INET6 && defined IPV6_V6ONLY)
++            struct sockaddr  *sa;
++            u_char            buf[NGX_SOCKADDR_STRLEN];
++
++            sa = (struct sockaddr *) ls->sockaddr;
++
++            if (sa->sa_family == AF_INET6) {
++
++                if (ngx_strcmp(&value[i].data[10], "n") == 0) {
++                    ls->ipv6only = 1;
++
++                } else if (ngx_strcmp(&value[i].data[10], "ff") == 0) {
++                    ls->ipv6only = 2;
++
++                } else {
++                    ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
++                            "invalid ipv6only flags \"%s\"",
++                            &value[i].data[9]);
++                    return NGX_CONF_ERROR;
++                }
++
++                ls->bind = 1;
++
++            } else {
++#if defined(nginx_version) && nginx_version >= 1005003
++                len = ngx_sock_ntop(sa, ls->socklen, buf, NGX_SOCKADDR_STRLEN, 1);
++#else
++                len = ngx_sock_ntop(sa, buf, NGX_SOCKADDR_STRLEN, 1);
++#endif
++
++                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
++                        "ipv6only is not supported "
++                        "on addr \"%*s\", ignored", len, buf);
++            }
++
++            continue;
++#else
++            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
++                    "bind ipv6only is not supported "
++                    "on this platform");
++            return NGX_CONF_ERROR;
++#endif
++        }
++
++        if (ngx_strcmp(value[i].data, "ssl") == 0) {
++#if (NGX_FILTER_SSL)
++            ls->ssl = 1;
++            continue;
++#else
++            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
++                               "the \"ssl\" parameter requires "
++                               "ngx_filter_ssl_module");
++            return NGX_CONF_ERROR;
++#endif
++        }
++
++        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
++                "the invalid \"%V\" parameter", &value[i]);
++        return NGX_CONF_ERROR;
++    }
++
++    return NGX_CONF_OK;
++}
++
++
++
++
++static char *
++ngx_filter_core_redirect(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
++{
++    ngx_filter_core_srv_conf_t *cscf = conf;
++
++    ngx_str_t                  *value, s;
++	ngx_filter_regex_elt_t      *re;
++	ngx_regex_compile_t         rc;
++	int                         port;
++	ngx_listening_t            *ls;
++	u_char	errstr[NGX_MAX_CONF_ERRSTR];
++	int		preload = 0;
++
++
++    value = cf->args->elts;
++
++	//check port
++	port = ngx_atoi(value[2].data, value[2].len);
++	if (port < 1 || port > 65535) {
++        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
++                "the invalid \"%V\" port", &value[2]);
++		return NGX_CONF_ERROR;
++	}
++
++	ls = ngx_filter_find_ls(cf, (in_port_t)port);
++	if(ls == NULL){
++        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
++                "\"%V\" port isn't listening", &value[3]);
++		return NGX_CONF_ERROR;		
++	}
++
++	// default
++	if (ngx_strcmp(value[1].data, "default") == 0) {
++		if(cscf->default_ls != NGX_CONF_UNSET_PTR){
++	        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
++	                "too many redirect default");
++			return NGX_CONF_ERROR;
++		}
++		cscf->default_ls = ls;
++		return NGX_CONF_OK;
++	}
++
++
++	//check preload port
++	if (ngx_strcmp(value[1].data, "preload") == 0) {
++		preload = 1;
++		
++		//return NGX_CONF_OK;
++	}
++
++
++	// regex add 
++	
++
++    if (cscf->regex == NGX_CONF_UNSET_PTR) {
++        cscf->regex = ngx_array_create(cf->pool, 4, sizeof(ngx_filter_regex_elt_t));
++        if (cscf->regex == NULL) {
++            return NGX_CONF_ERROR;
++        }
++    }
++
++    re = ngx_array_push(cscf->regex);
++    if (re == NULL) {
++        return NGX_CONF_ERROR;
++    }
++
++
++	ngx_memzero(&rc, sizeof(ngx_regex_compile_t));
++	if(preload){
++		ngx_str_set(&rc.pattern, preload_pattern);
++		re->preload = 1;
++
++
++	
++		if (ngx_strncmp(value[3].data, "zone=", 5) == 0) {
++		
++			s.len = value[3].len - 5;
++			s.data = value[3].data + 5;
++		
++			re->preload_shm_zone = ngx_shared_memory_add(cf, &s, 0,
++				&ngx_http_preload_cache_module);
++			if (re->preload_shm_zone == NULL) {
++				return NGX_CONF_ERROR;
++			}
++		}
++
++
++		
++	}else{
++    	rc.pattern = value[1];
++		re->preload = 0;
++	}
++    rc.pool = cf->pool;
++    rc.err.len = NGX_MAX_CONF_ERRSTR;
++    rc.err.data = errstr;
++
++	if (ngx_regex_compile(&rc) != NGX_OK) {
++		ngx_conf_log_error(NGX_LOG_EMERG, cf, 0, "%V", &rc.err);
++		return NGX_CONF_ERROR;
++	}
++
++	re->regex = rc.regex;
++	re->ls = ls;
++
++    return NGX_CONF_OK;
++}
++
++
++
++static ngx_listening_t *
++ngx_filter_find_ls(ngx_conf_t *cf, in_port_t port)
++{
++	ngx_listening_t       *ls;
++	ngx_uint_t             n; 
++    struct sockaddr       *sa;
++    struct sockaddr_in    *sin;
++    in_port_t              p;
++
++	
++	ls = cf->cycle->listening.elts;
++	for (n = 0; n < cf->cycle->listening.nelts; n++){
++		sa = (struct sockaddr *) (&ls[n])->sockaddr;
++	
++		switch (sa->sa_family) {
++	
++#if (NGX_HAVE_INET6)
++		case AF_INET6:
++			return NULL;
++#endif
++	
++		default: /* AF_INET */
++			sin = (struct sockaddr_in *) sa;
++			p = ntohs(sin->sin_port);
++			break;
++		}
++		if (p == port) {
++			return &ls[n];
++		}
++	}
++	return NULL;
++}
++
++static char *
++ngx_filter_log_set_access_log(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
++{
++    ngx_filter_core_srv_conf_t *cscf = conf;
++    ngx_filter_log_srv_conf_t  *lscf = cscf->access_log;
++
++    ssize_t                     size;
++    ngx_str_t                  *value, name;
++    ngx_filter_log_t              *log;
++#if (nginx_version) >= 1003010 || (nginx_version) >= 1002007 && (nginx_version) < 1003000
++    ngx_filter_log_buf_t         *buffer;
++#endif
++
++    value = cf->args->elts;
++
++    if (ngx_strcmp(value[1].data, "off") == 0) {
++        lscf->off = 1;
++        if (cf->args->nelts == 2) {
++            return NGX_CONF_OK;
++        }
++
++        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
++                           "invalid parameter \"%V\"", &value[2]);
++        return NGX_CONF_ERROR;
++    }
++
++    if (lscf->logs == NULL) {
++        lscf->logs = ngx_array_create(cf->pool, 2, sizeof(ngx_filter_log_t));
++        if (lscf->logs == NULL) {
++            return NGX_CONF_ERROR;
++        }
++    }
++
++    log = ngx_array_push(lscf->logs);
++    if (log == NULL) {
++        return NGX_CONF_ERROR;
++    }
++
++    ngx_memzero(log, sizeof(ngx_filter_log_t));
++
++    log->file = ngx_conf_open_file(cf->cycle, &value[1]);
++    if (log->file == NULL) {
++        return NGX_CONF_ERROR;
++    }
++
++    if (cf->args->nelts == 3) {
++        if (ngx_strncmp(value[2].data, "buffer=", 7) != 0) {
++            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
++                               "invalid parameter \"%V\"", &value[2]);
++            return NGX_CONF_ERROR;
++        }
++
++        name.len = value[2].len - 7;
++        name.data = value[2].data + 7;
++
++        size = ngx_parse_size(&name);
++
++        if (size == NGX_ERROR) {
++            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
++                               "invalid parameter \"%V\"", &value[2]);
++            return NGX_CONF_ERROR;
++        }
++
++#if (nginx_version) >= 1003010 || (nginx_version) >= 1002007 && (nginx_version) < 1003000
++        if (log->file->data) {
++
++            buffer = log->file->data;
++
++            if (buffer->last - buffer->pos != size) {
++                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
++                        "access_log \"%V\" already defined "
++                        "with different buffer size", &value[1]);
++                return NGX_CONF_ERROR;
++            }
++
++            return NGX_CONF_OK;
++        }
++
++        buffer = ngx_pcalloc(cf->pool, sizeof(ngx_filter_log_buf_t));
++        if (buffer == NULL) {
++            return NGX_CONF_ERROR;
++        }
++
++        buffer->start = ngx_palloc(cf->pool, size);
++        if (buffer->start == NULL) {
++            return NGX_CONF_ERROR;
++        }
++
++        buffer->pos = buffer->start;
++        buffer->last = buffer->start + size;
++
++        log->file->data = buffer;
++#else
++        if (log->file->buffer) {
++            if (log->file->last - log->file->pos != size) {
++                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
++                                   "access_log \"%V\" already defined "
++                                   "with different buffer size", &value[1]);
++                return NGX_CONF_ERROR;
++            }
++
++            return NGX_CONF_OK;
++        }
++
++        log->file->buffer = ngx_palloc(cf->pool, size);
++        if (log->file->buffer == NULL) {
++            return NGX_CONF_ERROR;
++        }
++
++        log->file->pos = log->file->buffer;
++        log->file->last = log->file->buffer + size;
++#endif
++    }
++
++    return NGX_CONF_OK;
++}
+diff --git a/src/filter/ngx_filter_log.c b/src/filter/ngx_filter_log.c
+new file mode 100755
+index 0000000..6451827
+--- /dev/null
++++ b/src/filter/ngx_filter_log.c
+@@ -0,0 +1,226 @@
++
++
++#include <ngx_config.h>
++#include <ngx_core.h>
++#include <ngx_filter.h>
++
++
++static u_char * ngx_filter_time(u_char *buf, time_t t);
++static u_char *ngx_filter_log_fill(ngx_filter_session_t *s, u_char *buf);
++static void ngx_filter_log_write(ngx_filter_session_t *s, ngx_filter_log_t *log,
++    u_char *buf, size_t len);
++
++
++ngx_int_t
++ngx_filter_log_handler(ngx_filter_session_t *s)
++{
++    u_char                   *line, *p;
++    size_t                    len;
++    ngx_uint_t                l;
++    ngx_connection_t         *c;
++    ngx_filter_log_t            *log;
++    ngx_open_file_t          *file;
++#if (nginx_version) >= 1003010 || (nginx_version) >= 1002007 && (nginx_version) < 1003000
++    ngx_filter_log_buf_t        *buffer;
++#endif
++   ngx_filter_log_srv_conf_t    *lscf;
++    ngx_filter_core_srv_conf_t  *cscf;
++
++    ngx_log_debug0(NGX_LOG_DEBUG_TCP, s->connection->log, 0,
++                   "tcp access log handler");
++
++    cscf = ngx_filter_get_module_srv_conf(s, ngx_filter_core_module);
++    lscf = cscf->access_log;
++
++    if (lscf->off) {
++        return NGX_OK;
++    }
++
++    c = s->connection;
++    log = lscf->logs->elts;
++    for (l = 0; l < lscf->logs->nelts; l++) {
++
++        if (ngx_time() == log[l].disk_full_time) {
++
++            /*
++             * on FreeBSD writing to a full filesystem with enabled softupdates
++             * may block process for much longer time than writing to non-full
++             * filesystem, so we skip writing to a log for one second
++             */
++
++            continue;
++        }
++
++        len = 0;
++
++        /* Calculate the length */
++        len += sizeof("1970/09/28 12:00:00");   /* log time */
++        len += NGX_INT64_LEN + 2;               /* [ngx_pid] */
++        len += c->addr_text.len + 1;            /* client address */
++        len += s->addr_text->len + 1;           /* this session address */
++        len += sizeof("1970/09/28 12:00:00");   /* accept time */
++        len += sizeof("255.255.255.255:65536"); /* upstream address */
++        len += NGX_OFF_T_LEN + 1;               /* read bytes from client */
++        len += NGX_OFF_T_LEN + 1;               /* write bytes to client */
++        len += NGX_LINEFEED_SIZE;
++
++        file = log[l].file;
++
++#if (nginx_version) >= 1003010 || (nginx_version) >= 1002007 && (nginx_version) < 1003000
++        if (file && file->data) {
++
++            buffer = file->data;
++
++            if (len > (size_t) (buffer->last - buffer->pos)) {
++
++                ngx_filter_log_write(s, &log[l], buffer->start,
++                                  buffer->pos - buffer->start);
++
++                buffer->pos = buffer->start;
++            }
++
++            if (len <= (size_t) (buffer->last - buffer->pos)) {
++
++                p = buffer->pos;
++
++                p = ngx_filter_log_fill(s, p);
++
++                buffer->pos = p;
++
++                continue;
++            }
++        }
++#else
++        if (file && file->buffer) {
++
++            if (len > (size_t) (file->last - file->pos)) {
++
++                ngx_filter_log_write(s, &log[l], file->buffer,
++                                  file->pos - file->buffer);
++
++                file->pos = file->buffer;
++            }
++
++            if (len <= (size_t) (file->last - file->pos)) {
++
++                p = file->pos;
++
++                p = ngx_filter_log_fill(s, p);
++
++                file->pos = p;
++
++                continue;
++            }
++        }
++#endif
++
++        line = ngx_pnalloc(s->pool, len);
++        if (line == NULL) {
++            return NGX_ERROR;
++        }
++
++        p = line;
++
++        p = ngx_filter_log_fill(s, p);
++
++        ngx_filter_log_write(s, &log[l], line, p - line);
++    }
++
++    return NGX_OK;
++}
++
++
++static u_char *
++ngx_filter_time(u_char *buf, time_t t)
++{
++    ngx_tm_t    tm;
++
++    ngx_localtime(t, &tm);
++
++    return ngx_sprintf(buf, "%4d/%02d/%02d %02d:%02d:%02d",
++                       tm.ngx_tm_year, tm.ngx_tm_mon,
++                       tm.ngx_tm_mday, tm.ngx_tm_hour,
++                       tm.ngx_tm_min, tm.ngx_tm_sec);
++}
++
++
++static u_char *
++ngx_filter_log_fill(ngx_filter_session_t *s, u_char *buf) 
++{
++    u_char              *last;
++    ngx_str_t           *name;
++    ngx_connection_t    *c;
++
++    c = s->connection;
++
++    last = ngx_cpymem(buf, ngx_cached_err_log_time.data,
++            ngx_cached_err_log_time.len);
++
++    last = ngx_sprintf(last, " [%P]", ngx_pid);
++    last = ngx_sprintf(last, " %V", &c->addr_text);
++    last = ngx_sprintf(last, " %V ", s->addr_text);
++    last = ngx_filter_time(last, s->start_sec);
++    
++    name = NULL;
++
++    if (name) {
++        last = ngx_sprintf(last, " %V", name);
++    }
++    else {
++        last = ngx_sprintf(last, " -");
++    }
++
++    last = ngx_sprintf(last, " %O", s->bytes_read);
++    last = ngx_sprintf(last, " %O", s->bytes_write);
++
++    ngx_linefeed(last);
++
++    return last;
++}
++
++
++static void
++ngx_filter_log_write(ngx_filter_session_t *s, ngx_filter_log_t *log, u_char *buf,
++    size_t len)
++{
++    u_char     *name;
++    time_t      now;
++    ssize_t     n;
++    ngx_err_t   err;
++
++    if(len == 0) return;
++
++    name = log->file->name.data;
++    n = ngx_write_fd(log->file->fd, buf, len);
++
++    if (n == (ssize_t) len) {
++        return;
++    }
++
++    now = ngx_time();
++
++    if (n == -1) {
++        err = ngx_errno;
++
++        if (err == NGX_ENOSPC) {
++            log->disk_full_time = now;
++        }
++
++        if (now - log->error_log_time > 59) {
++            ngx_log_error(NGX_LOG_ALERT, s->connection->log, err,
++                          ngx_write_fd_n " to \"%s\" failed", name);
++
++            log->error_log_time = now;
++        }
++
++        return;
++    }
++
++    if (now - log->error_log_time > 59) {
++        ngx_log_error(NGX_LOG_ALERT, s->connection->log, 0,
++                      ngx_write_fd_n " to \"%s\" was incomplete: %z of %uz",
++                      name, n, len);
++
++        log->error_log_time = now;
++    }
++}
+diff --git a/src/filter/ngx_filter_session.c b/src/filter/ngx_filter_session.c
+new file mode 100755
+index 0000000..a3dd5ae
+--- /dev/null
++++ b/src/filter/ngx_filter_session.c
+@@ -0,0 +1,612 @@
++/*
++ * author : yubo@xiaomi.com
++ */
++#include <ngx_config.h>
++#include <ngx_core.h>
++#include <ngx_event.h>
++#include <ngx_filter.h>
++
++
++static void ngx_filter_init_session_connection(ngx_connection_t *c);
++static void ngx_filter_init_session(ngx_filter_session_t *s);
++static void ngx_filter_write_handler(ngx_event_t *wev);
++static void ngx_filter_read_handler(ngx_event_t *rev);
++static void ngx_filter_redirect_to(ngx_event_t *rev, ngx_listening_t *ls);
++static int ngx_filter_redirect_regex(ngx_connection_t *c, ngx_listening_t **lsp);
++
++
++
++
++#if (NGX_FILTER_SSL)
++static void ngx_filter_ssl_init_connection(ngx_ssl_t *ssl, ngx_connection_t *c);
++static void ngx_filter_ssl_handshake_handler(ngx_connection_t *c);
++#endif
++
++
++void
++ngx_filter_init_connection(ngx_connection_t *c)
++{
++    ngx_uint_t            i;
++    ngx_filter_port_t       *port;
++    struct sockaddr      *sa;
++    struct sockaddr_in   *sin;
++    ngx_filter_log_ctx_t    *ctx;
++    ngx_filter_in_addr_t    *addr;
++    ngx_filter_session_t    *s;
++    ngx_filter_addr_conf_t  *addr_conf;
++#if (NGX_HAVE_INET6)
++    struct sockaddr_in6  *sin6;
++    ngx_filter_in6_addr_t   *addr6;
++#endif
++
++
++    /* find the server configuration for the address:port */
++
++    /* AF_INET only */
++
++    port = c->listening->servers;
++
++    if (port->naddrs > 1) {
++
++        /*
++         * There are several addresses on this port and one of them
++         * is the "*:port" wildcard so getsockname() is needed to determine
++         * the server address.
++         *
++         * AcceptEx() already gave this address.
++         */
++
++        if (ngx_connection_local_sockaddr(c, NULL, 0) != NGX_OK) {
++            ngx_filter_close_connection(c);
++            return;
++        }
++
++        sa = c->local_sockaddr;
++
++        switch (sa->sa_family) {
++
++#if (NGX_HAVE_INET6)
++        case AF_INET6:
++            sin6 = (struct sockaddr_in6 *) sa;
++
++            addr6 = port->addrs;
++
++            /* the last address is "*" */
++
++            for (i = 0; i < port->naddrs - 1; i++) {
++                if (ngx_memcmp(&addr6[i].addr6, &sin6->sin6_addr, 16) == 0) {
++                    break;
++                }
++            }
++
++            addr_conf = &addr6[i].conf;
++
++            break;
++#endif
++
++        default: /* AF_INET */
++            sin = (struct sockaddr_in *) sa;
++
++            addr = port->addrs;
++
++            /* the last address is "*" */
++
++            for (i = 0; i < port->naddrs - 1; i++) {
++                if (addr[i].addr == sin->sin_addr.s_addr) {
++                    break;
++                }
++            }
++
++            addr_conf = &addr[i].conf;
++
++            break;
++        }
++
++    } else {
++        switch (c->local_sockaddr->sa_family) {
++
++#if (NGX_HAVE_INET6)
++        case AF_INET6:
++            addr6 = port->addrs;
++            addr_conf = &addr6[0].conf;
++            break;
++#endif
++
++        default: /* AF_INET */
++            addr = port->addrs;
++            addr_conf = &addr[0].conf;
++            break;
++        }
++    }
++
++    s = ngx_pcalloc(c->pool, sizeof(ngx_filter_session_t));
++    if (s == NULL) {
++        ngx_filter_close_connection(c);
++        return;
++    }
++
++    if (addr_conf->default_ctx) {
++        s->main_conf = addr_conf->default_ctx->main_conf;
++        s->srv_conf = addr_conf->default_ctx->srv_conf;
++    }
++    else {
++        s->main_conf = addr_conf->ctx->main_conf;
++        s->srv_conf = addr_conf->ctx->srv_conf;
++    }
++
++    s->addr_text = &addr_conf->addr_text;
++
++    c->data = s;
++    s->connection = c;
++
++    ngx_log_error(NGX_LOG_INFO, c->log, 0, "*%ui client %V connected to %V",
++                  c->number, &c->addr_text, s->addr_text);
++
++    ctx = ngx_palloc(c->pool, sizeof(ngx_filter_log_ctx_t));
++    if (ctx == NULL) {
++        ngx_filter_close_connection(c);
++        return;
++    }
++
++    ctx->client = &c->addr_text;
++    ctx->session = s;
++
++    c->log->connection = c->number;
++    c->log->handler = ngx_filter_log_error;
++    c->log->data = ctx;
++    c->log->action = "nginx tcp module init connection";
++
++    c->log_error = NGX_ERROR_INFO;
++
++
++    ngx_filter_init_session_connection(c);
++}
++
++
++
++
++
++static void
++ngx_filter_init_session_connection(ngx_connection_t *c)
++{
++    ngx_time_t               *tp;
++    ngx_filter_session_t        *s;
++    ngx_filter_core_srv_conf_t  *cscf;
++
++    s = c->data;
++
++    s->signature = NGX_FILTER_MODULE;
++    s->pool = c->pool;
++
++    cscf = ngx_filter_get_module_srv_conf(s, ngx_filter_core_module);
++    if (cscf == NULL) {
++        ngx_filter_finalize_session(s);
++        return;
++    }
++
++    s->ctx = ngx_pcalloc(s->pool, sizeof(void *) * ngx_filter_max_module);
++    if (s->ctx == NULL) {
++        ngx_filter_finalize_session(s);
++        return;
++    }
++
++    tp = ngx_timeofday();
++    s->start_sec = tp->sec;
++    s->start_msec = tp->msec;
++
++    s->bytes_read = 0;
++    s->bytes_write = 0;
++    ngx_filter_init_session(s);
++}
++
++
++
++
++
++
++static void
++ngx_filter_init_session(ngx_filter_session_t *s)
++{
++    ngx_connection_t             *c;
++    ngx_filter_core_srv_conf_t  *cscf;
++
++	c = s->connection;
++
++	ngx_log_debug0(NGX_LOG_DEBUG_FILTER, c->log, 0, "filter init session");
++
++	cscf = ngx_filter_get_module_srv_conf(s, ngx_filter_core_module);
++
++    s->buffer = ngx_create_temp_buf(s->connection->pool, cscf->buffer_size);
++    if (s->buffer == NULL) {
++		ngx_filter_close_connection(c);
++        return;
++    }
++
++	s->out.len = 0;
++
++	c->write->handler = ngx_filter_write_handler;
++	c->read->handler = ngx_filter_read_handler;
++
++	//timeout handle ?
++	ngx_add_timer(c->read, cscf->timeout);
++
++	if (ngx_handle_read_event(c->read, 0) != NGX_OK) {
++#if (NGX_STAT_STUB)
++		(void) ngx_atomic_fetch_add(ngx_stat_reading, -1);
++#endif
++		ngx_filter_close_connection(c);
++		return;
++	}	
++	return;
++	
++
++}
++
++
++static void
++ngx_filter_write_handler(ngx_event_t *wev) 
++{
++    ngx_connection_t    *c;
++
++    c = wev->data;
++
++    ngx_log_debug1(NGX_LOG_DEBUG_FILTER, wev->log, 0,
++                   "filter dummy write handler: %d", c->fd);
++
++	return;
++}
++
++static void
++ngx_filter_read_handler(ngx_event_t *rev) 
++{
++    ngx_connection_t    *c;
++	int                 ret;
++	ngx_filter_core_srv_conf_t  *cscf;
++	ngx_listening_t     *ls;
++
++    c = rev->data;
++	cscf = ngx_filter_get_module_srv_conf((ngx_filter_session_t *)c->data, ngx_filter_core_module);
++	ngx_event_add_timer(rev, cscf->timeout);
++
++
++    ngx_log_debug1(NGX_LOG_DEBUG_FILTER, rev->log, 0,
++                   "filter dummy read handler: %d", c->fd);	
++
++    if (rev->timedout) {
++        ngx_log_error(NGX_LOG_INFO, c->log, NGX_ETIMEDOUT, "client timed out redirect to default");
++        ngx_filter_redirect_to(rev, cscf->default_ls);
++		
++        return;
++    }
++
++	ret = ngx_filter_redirect_regex(c, &ls);
++
++	if (ngx_handle_read_event(c->read, 0) != NGX_OK) {
++#if (NGX_STAT_STUB)
++		(void) ngx_atomic_fetch_add(ngx_stat_reading, -1);
++#endif
++		ngx_filter_close_connection(c);
++		return;
++	}
++
++	
++	switch (ret) {
++		case NGX_ERROR:
++			ngx_filter_close_connection(c);
++            break;
++		case NGX_REDIRECT_TO:
++			ngx_filter_redirect_to(rev, ls);
++			break;
++		case NGX_REDIRECT_TO_DEFAULT:
++			ngx_filter_redirect_to(rev, cscf->default_ls);
++			break;
++		default: // NGX_REDIRECT_PAAS
++		    break;
++	}
++	return;
++
++}
++
++
++typedef struct {
++    u_char                           color;
++    u_char                           dummy;
++    u_short                          url_len;
++    u_short                          path_len;
++    u_short                          disposition_len;
++    ngx_int_t                        code;
++    time_t                           start;
++    time_t                           expires;
++    u_char                           data[1];
++} ngx_http_preload_cache_node_t;
++
++typedef struct {
++    ngx_rbtree_t                     rbtree;
++    ngx_rbtree_node_t                sentinel;
++    time_t                           ts;
++} ngx_http_preload_cache_shctx_t;
++
++
++typedef struct {
++    ngx_http_preload_cache_shctx_t   *sh;
++    ngx_slab_pool_t                  *shpool;
++} ngx_http_preload_cache_ctx_t;
++
++
++typedef struct {
++    ngx_shm_zone_t                   *shm_zone;
++} ngx_http_preload_cache_conf_t;
++
++
++
++static ngx_http_preload_cache_node_t *
++ngx_http_preload_cache_lookup(ngx_shm_zone_t *shm_zone, 
++                              ngx_str_t *url)
++{
++    ngx_int_t                      rc;
++    ngx_rbtree_node_t              *node, *sentinel;
++    ngx_http_preload_cache_ctx_t   *ctx;
++    ngx_http_preload_cache_node_t  *pc = NULL, *rcpc = NULL;
++    ngx_uint_t hash = ngx_crc32_short(url->data, url->len);
++
++    if (shm_zone == NULL){
++        return NULL;
++    }
++
++    ctx = shm_zone->data;
++    node = ctx->sh->rbtree.root;
++    sentinel = ctx->sh->rbtree.sentinel;
++    while (node != sentinel) {
++
++        if (hash < node->key) {
++            node = node->left;
++            continue;
++        }
++
++        if (hash > node->key) {
++            node = node->right;
++            continue;
++        }
++
++        // hash == node->key
++
++        pc = (ngx_http_preload_cache_node_t *) &node->color;
++
++        rc = ngx_memn2cmp(url->data, pc->data, url->len, (size_t) pc->url_len);
++
++        if (rc == 0) {
++            rcpc = pc;
++            break;
++        }
++
++        node = (rc < 0) ? node->left : node->right;
++    }
++
++    return rcpc;
++}
++
++
++static int ngx_filter_redirect_regex(ngx_connection_t *c, ngx_listening_t **lsp)
++{
++    ngx_filter_session_t   *s;
++	ngx_filter_core_srv_conf_t  *cscf;
++	ngx_uint_t                  i;
++    ssize_t                     n;
++    ngx_int_t                   ret;
++	ngx_err_t            err;
++	char                 buf[NGX_BUF_SIZE];
++    ngx_filter_regex_elt_t  *re;
++	int vector[18];
++
++    s = c->data;
++	cscf = ngx_filter_get_module_srv_conf(s, ngx_filter_core_module);
++
++	re = cscf->regex->elts;
++	
++	n = recv(c->fd, buf, NGX_BUF_SIZE, MSG_PEEK);
++	err = ngx_socket_errno;
++
++    ngx_log_debug2(NGX_LOG_DEBUG_TCP, c->log, err,
++			   "filter check recv(): [%d](%s)", n, buf);
++
++	n = recv(c->fd, buf, NGX_BUF_SIZE, MSG_PEEK);
++	err = ngx_socket_errno;
++	if (n > 0 || err == NGX_EAGAIN) {
++
++		ret = NGX_REGEX_NO_MATCHED;
++		for (i = 0; i < cscf->regex->nelts; i++) {
++		
++			ret = pcre_exec(re[i].regex->code, 
++				re[i].regex->extra,
++				(const char *) buf,
++				(size_t)n > cscf->buffer_size ? cscf->buffer_size : (size_t)n, 
++				0, 
++				PCRE_BSR_ANYCRLF, 
++				vector, 
++				18);
++			if (ret == NGX_REGEX_NO_MATCHED) {
++				continue;
++			}
++			if (ret < 0) {
++				ngx_log_error(NGX_LOG_ALERT, c->log, 0,
++							  ngx_regex_exec_n " failed: %i on \"%s\"",
++							  ret, buf);
++				break;
++			}
++		
++			/* match */
++			*lsp = re[i].ls;
++
++			break;
++		}
++
++
++
++        if (ret == NGX_REGEX_NO_MATCHED) {
++			if (n >= (ngx_int_t)cscf->buffer_size) {
++            	return NGX_REDIRECT_TO_DEFAULT;
++			}
++			return NGX_REDIRECT_PAAS;
++        }else if (ret < 0) {
++            ngx_log_debug2(NGX_LOG_DEBUG_FILTER, c->log, 0,
++                          " failed: %i on \"%s\"",
++                          n, buf);
++			return NGX_ERROR;
++        }else{  /* match */
++
++			/* check preload */
++			if(re[i].preload && ret == 6){
++				ngx_str_t* url = ngx_pcalloc(c->pool, sizeof(ngx_str_t));
++				url->len = vector[2*5+1] - vector[2*5] + vector[2*2+1] - vector[2*2];
++				url->data = ngx_pcalloc(c->pool, url->len);
++				ngx_memcpy(url->data, buf+vector[2*5],
++					vector[2*5+1] - vector[2*5]);
++				ngx_memcpy(url->data + vector[2*5+1] - vector[2*5],
++					buf+vector[2*2], vector[2*2+1] - vector[2*2]);
++
++				ngx_http_preload_cache_node_t *node;
++				//ngx_http_preload_cache_ctx_t  *ctx;
++				//ctx = re[i].preload_shm_zone->data;
++				//ngx_shmtx_lock(&ctx->shpool->mutex);
++				node = ngx_http_preload_cache_lookup(re[i].preload_shm_zone, url);
++				//ngx_shmtx_unlock(&ctx->shpool->mutex);
++
++				if (!node){
++					ngx_log_error(NGX_LOG_INFO, c->log, err,
++                      "preload MISS: url:[%V] header[%s]",url, buf);				
++					return NGX_REDIRECT_TO_DEFAULT;
++
++				}else{
++					ngx_log_error(NGX_LOG_INFO, c->log, err,
++								  "preload HIT: url:[%V] header[%s]",url, buf);
++					return NGX_REDIRECT_TO;
++				}
++
++			}
++
++		
++	        return NGX_REDIRECT_TO;
++        }
++	}
++
++    if (n == NGX_AGAIN || n == 0) {
++        return NGX_REDIRECT_PAAS;;
++    }
++
++    if (n == NGX_ERROR) {
++        return NGX_REDIRECT_TO_DEFAULT;
++    }
++
++    return NGX_REDIRECT_PAAS;
++}
++
++static void ngx_filter_redirect_to(ngx_event_t *rev, ngx_listening_t *ls) {
++	ngx_connection_t *c;
++	ngx_filter_session_t   *s;
++	ngx_filter_core_srv_conf_t  *cscf;  
++
++    c = rev->data;
++    s = c->data;
++	cscf = ngx_filter_get_module_srv_conf(s, ngx_filter_core_module);
++
++	rev->timedout = 0;
++	ngx_event_add_timer(rev, cscf->timeout);
++	c->listening->post_accept_timeout = cscf->timeout;
++
++	c->listening = ls;
++
++    ngx_log_debug1(NGX_LOG_DEBUG_FILTER, c->log, 0,
++                   "filter ngx_filter_redirect_to: %V", &ls->addr_text);
++	c->data = NULL;
++	ls->handler(c);
++
++//    ngx_log_debug(NGX_LOG_DEBUG_FILTER, c->log, 0,
++//                   "filter c->read->handler(c->read)");
++	if (ngx_handle_read_event(c->read, 0) != NGX_OK) {
++		ngx_filter_close_connection(c);
++		return;
++	}
++}
++
++
++
++
++void 
++ngx_filter_finalize_session(ngx_filter_session_t *s)
++{
++    ngx_connection_t *c;
++    ngx_filter_cleanup_t *cln;
++
++    c = s->connection;
++
++    ngx_filter_log_handler(s);
++
++    ngx_log_debug1(NGX_LOG_DEBUG_FILTER, c->log, 0,
++                   "close tcp session: %d", c->fd);
++
++    for (cln = s->cleanup; cln; cln = cln->next) {
++        if (cln->handler) {
++            cln->handler(cln->data);
++            cln->handler = NULL;
++        }
++    }
++
++    ngx_filter_close_connection(c);
++
++    return;
++}
++
++
++void
++ngx_filter_close_connection(ngx_connection_t *c)
++{
++    ngx_pool_t  *pool;
++
++    ngx_log_debug1(NGX_LOG_DEBUG_FILTER, c->log, 0,
++                   "close FILTER connection: %d", c->fd);
++
++
++#if (NGX_STAT_STUB)
++    (void) ngx_atomic_fetch_add(ngx_stat_active, -1);
++#endif
++
++    c->destroyed = 1;
++
++    pool = c->pool;
++
++    ngx_close_connection(c);
++
++    ngx_destroy_pool(pool);
++}
++
++
++u_char *
++ngx_filter_log_error(ngx_log_t *log, u_char *buf, size_t len)
++{
++    u_char              *p;
++    ngx_filter_session_t   *s;
++    ngx_filter_log_ctx_t   *ctx;
++
++    p = buf;
++
++    if (log->action) {
++        p = ngx_snprintf(p, len + (buf - p), " while %s", log->action);
++    }
++
++    ctx = log->data;
++
++    p = ngx_snprintf(p, len + (buf - p), ", client: %V", ctx->client);
++
++    s = ctx->session;
++
++    if (s == NULL) {
++        return p;
++    }
++
++    p = ngx_snprintf(p, len + (buf - p), ", server: %V", s->addr_text);
++
++
++    return p;
++}
++
++
+diff --git a/src/filter/ngx_filter_session.h b/src/filter/ngx_filter_session.h
+new file mode 100755
+index 0000000..0793b5c
+--- /dev/null
++++ b/src/filter/ngx_filter_session.h
+@@ -0,0 +1,72 @@
++
++#ifndef _NGX_FILTER_SESSION_H_INCLUDED_
++#define _NGX_FILTER_SESSION_H_INCLUDED_
++
++
++#include <ngx_config.h>
++#include <ngx_core.h>
++#include <ngx_event.h>
++#include <ngx_event_connect.h>
++#include <ngx_filter.h>
++
++
++#define NGX_REDIRECT_TO          1
++#define NGX_REDIRECT_PAAS        2
++#define NGX_REDIRECT_TO_DEFAULT  3
++
++#define NGX_BUF_SIZE               10240
++
++
++
++typedef struct ngx_filter_session_s {
++    uint32_t                signature;         /* "FILTER" */
++
++    ngx_pool_t             *pool;
++
++    ngx_connection_t       *connection;
++
++    ngx_str_t               out;
++    ngx_buf_t              *buffer;
++
++    void                  **ctx;
++    void                  **main_conf;
++    void                  **srv_conf;
++
++    ngx_resolver_ctx_t     *resolver_ctx;
++
++    ngx_filter_cleanup_t  *cleanup;
++
++    time_t                  start_sec;
++    ngx_msec_t              start_msec;
++
++    off_t                   bytes_read;
++    off_t                   bytes_write;
++
++    unsigned                quit:1;
++    ngx_str_t              *addr_text;
++    ngx_str_t               host;
++
++} ngx_filter_session_t;
++
++
++typedef void (*ngx_filter_cleanup_pt)(void *data);
++
++
++struct ngx_filter_cleanup_s {
++    ngx_filter_cleanup_pt      handler;
++    void                       *data;
++    ngx_filter_cleanup_t      *next;
++};
++
++void ngx_filter_init_connection(ngx_connection_t *c);
++
++void ngx_filter_close_connection(ngx_connection_t *c);
++
++u_char *ngx_filter_log_error(ngx_log_t *log, u_char *buf, size_t len);
++
++void ngx_filter_finalize_session(ngx_filter_session_t *s);
++
++
++ngx_int_t ngx_filter_log_handler(ngx_filter_session_t *s);
++
++#endif

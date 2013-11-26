@@ -1,0 +1,61 @@
+diff -aru /home/liutao/code/XiaoQiang/feeds/packages/net/nginx/pkg-src/src/core/ngx_connection.c ./src/core/ngx_connection.c
+--- /home/liutao/code/XiaoQiang/feeds/packages/net/nginx/pkg-src/src/core/ngx_connection.c	2013-11-20 18:09:06.888255806 +0800
++++ ./src/core/ngx_connection.c	2013-11-20 22:05:25.952147598 +0800
+@@ -1060,6 +1060,11 @@
+         break;
+     }
+ 
++    //LIUTAO debug
++    ngx_str_t ss;
++    ss.len = ngx_sock_ntop(c->dst_sockaddr, ss.data, ss.len, port);
++    ngx_log_debug0(NGX_LOG_CRIT, c->log, 0, "LIUTAO: get addr1: %s",ss.data);
++
+     if (addr == 0) {
+ 
+         len = NGX_SOCKADDRLEN;
+@@ -1076,6 +1081,10 @@
+             t->sin_family = c->sockaddr->sa_family;
+             t->sin_port = htons(65535);
+             t->sin_addr.s_addr = inet_addr("0.0.0.1");
++
++            //LIUTAO debug
++            ss.len = ngx_sock_ntop(t,ss.data, ss.len, port);
++            ngx_log_debug0(NGX_LOG_CRIT, c->log, 0, "LIUTAO: get addr2: %s",ss.data);
+         }
+ 
+         c->dst_sockaddr = ngx_palloc(c->pool, len);
+@@ -1092,6 +1101,9 @@
+ 
+     s->len = ngx_sock_ntop(c->dst_sockaddr, s->data, s->len, port);
+ 
++    //LIUTAO
++    ngx_log_debug0(NGX_LOG_CRIT, c->log, 0, "LIUTAO: get addr3: %s",s->data);
++
+     return NGX_OK;
+ }
+ #endif
+diff -aru /home/liutao/code/XiaoQiang/feeds/packages/net/nginx/pkg-src/src/event/ngx_event_accept.c ./src/event/ngx_event_accept.c
+--- /home/liutao/code/XiaoQiang/feeds/packages/net/nginx/pkg-src/src/event/ngx_event_accept.c	2013-11-20 18:09:06.888255806 +0800
++++ ./src/event/ngx_event_accept.c	2013-11-20 22:16:00.768142753 +0800
+@@ -187,6 +187,8 @@
+             t->sin_addr.s_addr = inet_addr("0.0.0.1");
+         }
+ 
++
++
+         c->dst_sockaddr = ngx_palloc(c->pool, socklen);
+         if (c->dst_sockaddr == NULL) {
+             ngx_close_accepted_connection(c);
+@@ -194,6 +196,12 @@
+         }
+ 
+         ngx_memcpy(c->dst_sockaddr, sa, socklen);
++
++        //LIUTAO
++        ngx_str_t s;
++        s.len = ngx_sock_ntop(c->dst_sockaddr, s.data, s.len, 0);
++        ngx_log_debug1(NGX_LOG_CRIT, c->log, 0, "LIUTAO: get addr3: %s",s.data);
++
+ #endif
+ 
+         log = ngx_palloc(c->pool, sizeof(ngx_log_t));

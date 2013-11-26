@@ -1,0 +1,263 @@
+diff -Naur src/tcp/ngx_tcp_core_module.c /home/liutao/code/XiaoQiang/feeds/packages/net/nginx/pkg-src/src/tcp/ngx_tcp_core_module.c
+--- src/tcp/ngx_tcp_core_module.c	2013-11-17 20:07:07.660011003 +0800
++++ /home/liutao/code/XiaoQiang/feeds/packages/net/nginx/pkg-src/src/tcp/ngx_tcp_core_module.c	2013-11-18 21:40:24.652907922 +0800
+@@ -134,7 +134,7 @@
+       NULL },
+ 
+     { ngx_string("redirect"),
+-      NGX_TCP_SRV_CONF | NGX_CONF_TAKE2,
++      NGX_TCP_MAIN_CONF|NGX_TCP_SRV_CONF|NGX_CONF_TAKE2,
+       ngx_tcp_set_redirect,
+       NGX_TCP_SRV_CONF_OFFSET,
+       0,
+@@ -928,35 +928,98 @@
+     return NGX_CONF_OK;
+ }
+ 
+-static char* ngx_tcp_parse_hostport(ngx_conf_t *cf, ngx_str_t *value, ngx_str_t *o_host, ngx_uint_t *o_port)
++#if (NGX_HAVE_INET6)
++//TODO: not support yet
++static char* ngx_tcp_parse_hostport6(ngx_conf_t *cf, ngx_str_t *value, struct in6_addr *o_host, in_port_t *o_port)
+ {
+-    if(value->len <= 0)
++    if (value->len <= 0 || !o_host || !o_port)
++        return NGX_CONF_ERROR ;
++
++    u_char *host, *lasthost, *port, *last;
++    ngx_int_t tport;
++
++    host = value->data;
++    last = host + value->len;
++
++    port = ngx_strlchr(host, last, ']');
++
++    if(port){ //include host, fomrat [host]:port
++        lasthost = port;
++        host = value->data + 1; //skip '['
++
++        port += 1;
++        if(*port != ':')
++            return NGX_CONF_ERROR;
++        port += 1; //skip ':'
++
++    }else{ //no host, just only port
++        port = host;
++    }
++
++    //get port
++    tport = ngx_atoi(port, last - port);
++    if(tport != INADDR_NONE)
++        *o_port = htons(tport);
++    else
++        return NGX_CONF_ERROR;
++
++    //get host
++    if(ngx_inet6_addr(host,lasthost-host,o_host->s6_addr) != NGX_OK){
+         return NGX_CONF_ERROR;
++    }
++
++    return NGX_CONF_OK;
++}
++#endif
+ 
+-    u_char *host,*port,*last;
+-    ngx_int_t len,n;
++static char* ngx_tcp_parse_hostport(ngx_conf_t *cf, ngx_str_t *value, struct in_addr *o_host, in_port_t *o_port)
++{
++    if (value->len <= 0 || !o_host || !o_port)
++        return NGX_CONF_ERROR ;
++
++    u_char *host, *port, *last;
++    ngx_int_t len;
++    ngx_int_t tport;
++    in_addr_t thost;
+ 
+     host = value->data;
+     last = host + value->len;
+ 
+-    port = ngx_strlchr(host,last,':');
++    port = ngx_strlchr(host, last, ':');
+ 
+-    if(port)  // with format of `host:port`
+-    {
++    if (port) { // with format of `host:port`
+         port += 1;
+         len = last - port;
+-        *o_port = ngx_atoi(port,len);
+-        o_host->data = host;
+-        o_host->len = port -1 - host;
+-    }else{
+-
+-        n = ngx_atoi(value->data,value->len);
+-        if(n != NGX_ERROR){ //with format of `port`
+-            *o_port = n;
+-            o_host->len = 0; //set to empty
+-        }else{
+-            ngx_conf_log_error(NGX_LOG_DEBUG, cf, 0, "TCP redirect set without port.");
+-            return NGX_CONF_ERROR;
++        tport = ngx_atoi(port, len);
++        if (tport != NGX_ERROR) {
++            *o_port = htons(tport);
++        }
++        else {
++            ngx_conf_log_error(NGX_LOG_ALERT, cf, 0, "TCP redirect, config wrong port format.");
++            return NGX_CONF_ERROR ;
++        }
++
++        thost = ngx_inet_addr(host, port - 1 - host);
++        if (thost != INADDR_NONE) {
++            o_host->s_addr = thost;
++        }
++        else {
++            ngx_conf_log_error(NGX_LOG_ALERT, cf, 0, "TCP redirect, config wrong host format.");
++            return NGX_CONF_ERROR ;
++        }
++    }
++    else {
++
++        tport = ngx_atoi(value->data, value->len);
++        if (tport != NGX_ERROR) { //with format of `port`
++            *o_port = htons(tport);
++
++            //no port set, will regard it as loopback address
++            o_host->s_addr = htonl(INADDR_LOOPBACK);
++        }
++        else {
++            ngx_conf_log_error(NGX_LOG_ALERT, cf, 0, "TCP redirect, config without port[mandatory].");
++            return NGX_CONF_ERROR ;
+         }
+     }
+     return NGX_CONF_OK;
+@@ -973,21 +1036,28 @@
+     cscf->redirect = (ngx_tcp_redirect_t *) ngx_palloc(cf->pool,sizeof(ngx_tcp_redirect_t));
+ 
+     if(cscf->redirect == NULL){
+-        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0, "can not get redirect");
++        ngx_conf_log_error(NGX_LOG_ALERT, cf, 0, "TCP redirect, can not set redirect");
+         return NGX_CONF_ERROR;
+     }
+ 
+     ngx_str_t *value=cf->args->elts;
+ 
+-    if(ngx_tcp_parse_hostport(cf, &value[1],&(cscf->redirect->host),&(cscf->redirect->port))!=NGX_CONF_OK)
++#if(NGX_HAVE_INET6)
++    //TODO: not support yet
++    if(ngx_tcp_parse_hostport6(cf, &value[1],&(cscf->redirect->host6.s6_addr),&(cscf->redirect->port))!=NGX_CONF_OK)
+         return NGX_CONF_ERROR;
+ 
+-    if(ngx_tcp_parse_hostport(cf, &value[2],&(cscf->redirect->redirect_host),&(cscf->redirect->redirect_port))!=NGX_CONF_OK)
+-            return NGX_CONF_ERROR;
++    if(ngx_tcp_parse_hostport6(cf, &value[2],&(cscf->redirect->redirect_host6.s6_addr),&(cscf->redirect->redirect_port))!=NGX_CONF_OK)
++        return NGX_CONF_ERROR;
++#endif
++
++    if(ngx_tcp_parse_hostport(cf, &value[1],&(cscf->redirect->host.s_addr),&(cscf->redirect->port))!=NGX_CONF_OK)
++        return NGX_CONF_ERROR;
++
++    if(ngx_tcp_parse_hostport(cf, &value[2],&(cscf->redirect->redirect_host.s_addr),&(cscf->redirect->redirect_port))!=NGX_CONF_OK)
++        return NGX_CONF_ERROR;
+ 
+-    ngx_conf_log_error(NGX_LOG_DEBUG, cf, 0, "TCP set redirect: %s:%d -> %s:%d",
+-                  cscf->redirect->host.len > 0 ? cscf->redirect->host.data : "LOOPBACK",cscf->redirect->port,
+-                  cscf->redirect->redirect_host.len > 0 ? cscf->redirect->redirect_host.data : "LOOPBACK",cscf->redirect->redirect_port);
++    ngx_conf_log_error(NGX_LOG_DEBUG, cf, 0, "TCP set redirect OK");
+ 
+     return NGX_CONF_OK;
+ }
+diff -Naur src/tcp/ngx_tcp.h /home/liutao/code/XiaoQiang/feeds/packages/net/nginx/pkg-src/src/tcp/ngx_tcp.h
+--- src/tcp/ngx_tcp.h	2013-11-17 14:55:13.826271792 +0800
++++ /home/liutao/code/XiaoQiang/feeds/packages/net/nginx/pkg-src/src/tcp/ngx_tcp.h	2013-11-18 21:02:15.608925389 +0800
+@@ -181,10 +181,14 @@
+ } ngx_tcp_log_srv_conf_t;
+ 
+ typedef struct{
+-    ngx_uint_t              port;
+-    ngx_str_t               host;
+-    ngx_uint_t              redirect_port;
+-    ngx_str_t               redirect_host;
++    in_port_t               port;
++    in_port_t               redirect_port;
++    struct in_addr          host;
++    struct in_addr          redirect_host;
++#if (NGX_HAVE_INET6)
++    struct in6_addr         host6;
++    struct in6_addr         redirect_host6;
++#endif
+ }ngx_tcp_redirect_t;
+ 
+ 
+diff -Naur src/tcp/ngx_tcp_upstream.c /home/liutao/code/XiaoQiang/feeds/packages/net/nginx/pkg-src/src/tcp/ngx_tcp_upstream.c
+--- src/tcp/ngx_tcp_upstream.c	2013-11-17 20:15:01.024007392 +0800
++++ /home/liutao/code/XiaoQiang/feeds/packages/net/nginx/pkg-src/src/tcp/ngx_tcp_upstream.c	2013-11-18 21:42:03.772907164 +0800
+@@ -1200,48 +1200,39 @@
+ 
+ 	
+     //if it's connected for health-check, just redirect to configured port to avoid dead-loop reference
+-    switch (pc->sockaddr->sa_family)
+-    {
++	if(cscf->redirect){
++        switch (pc->sockaddr->sa_family)
++        {
+ #if (NGX_HAVE_INET6)
+-        //TODO: need support ipv6
+-        case AF_INET6:
+-            return NGX_DECLINED;
+-            break;
++            //TODO: not support ipv6 yet
++            case AF_INET6:
++                return NGX_DECLINED;
++                break;
+ #endif
+-        case AF_INET: /* AF_INET */
+-            oc = (struct sockaddr_in*)pc->sockaddr;
++            case AF_INET: /* AF_INET */
++                oc = (struct sockaddr_in*)pc->sockaddr;
+ 
+-            //if not (localhost + tproxy port), will pass away directly
+-            if(oc->sin_port != htons(cscf->redirect->port) ||
+-                    (cscf->redirect->host.len > 0 &&
+-                     oc->sin_addr.s_addr != ngx_inet_addr(cscf->redirect->host.data,cscf->redirect->host.len)))
+-                break;
++                //if not (localhost + tproxy port), will pass away directly
++                if(oc->sin_port != cscf->redirect->port ||
++                        oc->sin_addr.s_addr != cscf->redirect->host.s_addr)
++                    break;
++
++                //change dest host and port to configured redirect port
++                oc->sin_addr.s_addr = cscf->redirect->redirect_host.s_addr;
++                oc->sin_port = cscf->redirect->redirect_port;
+ 
+-            //change dest host and port to configured redirect port
+-            in_addr_t to_addr;
+-            if(cscf->redirect->redirect_host.len > 0){
+-                to_addr = ngx_inet_addr(cscf->redirect->redirect_host.data,cscf->redirect->redirect_host.len);
+-            }else{
+-                to_addr = htonl(INADDR_LOOPBACK);
+-            }
+-            if(to_addr != INADDR_NONE) //if invalid, keep old addr
+-                oc->sin_addr.s_addr = to_addr;
+-            else
+-                return NGX_ERROR;
+-
+-            oc->sin_port = htons(cscf->redirect->redirect_port);
+-
+-            break;
+-        default:
+-            break;
+-    }
++                break;
++            default:
++                break;
++        }
++	}
+ 
+     pc->name->len = ngx_sock_ntop(s->connection->dst_sockaddr, pc->name->data,
+             NGX_SOCKADDR_STRLEN, 1);
+     if(pc->name->len == 0)
+         return NGX_ERROR;
+ 
+-    ngx_log_debug(NGX_LOG_DEBUG_TCP, s->connection->log, 0,"re-route TCP dest-connect to %s:%d", pc->name->data);
++    ngx_log_debug(NGX_LOG_DEBUG_TCP, s->connection->log, 0,"re-route TCP dest-connect to %s", pc->name->data);
+ 	
+     //s->upstream->peer.sockaddr = s->connection->dst_sockaddr;
+     //s->upstream->peer.socklen = s->connection->socklen;

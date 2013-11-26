@@ -1,0 +1,356 @@
+#!/bin/sh
+#
+#initial env and start nginx
+#
+#defined in package.nginx.Makefile
+NGINX_BIN=/usr/sbin/nginx
+ROMCONFDIR='/etc/nginx'
+NGINXCACHEDIR='/userdisk/nginx'
+#
+CACHELABLE='XQ4709AUTOCACHE'
+#
+NGINXTMPDIR='/tmp/nginx/'
+#
+RUNCONFDIR='/tmp/nginxconf'
+#
+export NGINXSTARTDELAY=30
+export NGINXDAEMONOFF='yes'
+#log level: debug | info | notice | warn | error | crit
+export NGINXERRLOGLEVEL='notice'
+#
+. /lib/lib.scripthelper.sh
+#
+. /lib/lib.wan.monitor.sh
+#
+RUNCONFDIR=$(strippath $RUNCONFDIR)
+mkdir -p $RUNCONFDIR
+if [ $? -ne 0 ]
+	then
+	conlog	"ERROR: mkdir -p $RUNCONFDIR failed: $(mkdir -p $RUNCONFDIR 2>&1)"
+	exit 1
+fi
+NGINXRUNCONF=$(strippath ${RUNCONFDIR}/nginx.conf)
+#
+#set default
+NGINX_CACHE='on'
+NGINX_AUTOCACHE='on'
+if [ -s "$MONITORCFGFILE" ]
+	then
+	. $MONITORCFGFILE
+fi
+#sed error_log to stderr if evn NGINXDAEMONOFF exist
+#sed daemon to off if evn NGINXDAEMONOFF exist
+errorloginit(){
+	#return 0 for ok
+	if [ "$NGINXDAEMONOFF" != 'yes' ]
+		then
+		return 0
+	fi
+	#
+	grep -iq '^daemon off' $NGINXRUNCONF
+	if [ $? -ne 0 ]
+		then
+		sed -i -e 's/^daemon on/daemon off/g' $NGINXRUNCONF
+		if [ $? -eq 0 ]
+			then
+			echo "INFO: set daemon off ok."
+		else
+			echo "ERROR: set daemon off failed, nginx no started."
+			return 1
+		fi
+	fi
+	if [ -z "$NGINXERRLOGLEVEL" ]
+		then
+		NGINXERRLOGLEVEL='notice'
+	fi
+	case "$NGINXERRLOGLEVEL" in
+		notice|warn|error|crit)
+			echo "INFO: error log level: $NGINXERRLOGLEVEL"
+			;;
+		debug|info)
+			echo "WARNING: error log level is for debug: $NGINXERRLOGLEVEL"
+			;;
+		*)
+			echo "WARNING: unknow error log level: $NGINXERRLOGLEVEL"
+			NGINXERRLOGLEVEL='notice'
+			echo "INFO: error log level: $NGINXERRLOGLEVEL"
+			;;
+	esac
+	#
+	grep -iq "^error_log stderr $NGINXERRLOGLEVEL" $NGINXRUNCONF
+	if [ $? -ne 0 ]
+		then
+		#
+		sed -i -e "s/^error_log.*/error_log stderr $NGINXERRLOGLEVEL;/g" $NGINXRUNCONF
+		if [ $? -eq 0 ]
+			then
+			echo "INFO: set errorlog to stderr ok."
+		else
+			echo "ERROR: set errorlog to stderr failed, nginx no started."
+			return 1
+		fi
+	fi
+	return 0
+}
+#
+cleanmountdir(){
+	local mntdir
+	mntdir="$1"
+	test -z "$mntdir" && return 1
+	for aaa in 1 2 3 4 5 6 7 8 9 0
+	do
+		mount | grep -q " $mntdir "
+		test $? -ne 0 && break
+		umount -f -r "$mntdir"
+		sleep 1
+	done
+	mount | grep -q " $mntdir "
+	if [ $? -eq 0 ]
+		then
+		return 1
+	else
+		return 0
+	fi
+}
+getnginxmasterpid(){
+	echo "$(ps w| grep "nginx: master process $NGINX_BIN -c $NGINXRUNCONF"|grep -v grep | head -n1 | awk '{print $1}')"
+}
+daemonstop(){
+	local umntlist
+	killpid "$(getnginxmasterpid)"
+	cleanmountdir "$NGINXCACHEDIR"
+	return $?
+}
+webrootinit(){
+	local rootdir rootinfo exitcode
+	exitcode=0
+	rootdir="$1"
+	rootinfo="$2"
+	test -z "$rootdir" && return 1
+	test -z "$rootinfo" && rootinfo="static"
+	mkdir -p ${rootdir}/ || exitcode=1
+	test -f ${rootdir}/favicon.ico || touch ${rootdir}/favicon.ico || exitcode=1
+	test -f ${rootdir}/index.html || echo "<h1>nginx ${rootinfo} server</h1>" > ${rootdir}/index.html || exitcode=1
+	test -f ${rootdir}/50x.html || echo "<h1>nginx ${rootinfo} server, file no found or internal error</h1>" > ${rootdir}/50x.html || exitcode=1
+	if [ $exitcode -ne 0 ]
+		then
+		echo "WARNING: web root $rootinfo($rootdir) initial failed."
+	fi
+	return $exitcode
+}
+datadirinit(){
+	local datadir exitcode
+	datadir="$1"
+	test -z "$datadir" && return 1
+	exitcode=0
+	mkdir -p ${datadir} 2>&1 || exitcode=1
+	mkdir -p ${datadir}/temp || exitcode=1
+	mkdir -p ${datadir}/cache || exitcode=1
+	mkdir -p ${datadir}/log || exitcode=1
+	mkdir -p ${datadir}/body || exitcode=1
+	mkdir -p ${datadir}/proxy || exitcode=1
+	mkdir -p ${datadir}/fastcgi || exitcode=1
+	mkdir -p ${datadir}/run || exitcode=1
+	mkdir -p ${datadir}/lock || exitcode=1
+	if [ $exitcode -ne 0 ]
+		then
+		echo "WARNING: data root $datadir initial failed."
+	fi
+	return $exitcode
+}
+envinit(){
+	local exitcode
+	NGINXTMPDIR=$(slaprtrim $NGINXTMPDIR)
+	NGINXCACHEDIR=$(slaprtrim $NGINXCACHEDIR)
+
+	mkdir -p $NGINXCACHEDIR >/dev/null 2>&1
+
+	#conf sync
+	rm -rf ${RUNCONFDIR} && mkdir -p ${RUNCONFDIR} && cp -a ${ROMCONFDIR}/* ${RUNCONFDIR}/
+	if [ $? -ne 0 ]
+		then
+		echo "ERROR: sync configure failed: ${ROMCONFDIR} => ${RUNCONFDIR}"
+		return 1
+	fi
+	datadirinit "$NGINXTMPDIR" || return 1
+	#set default
+	NGINX_CACHE='on'
+	NGINX_AUTOCACHE='on'
+	if [ -s "$MONITORCFGFILE" ]
+		then
+		. $MONITORCFGFILE
+	fi
+	#echo "DEBUG: NGINX_CACHE=$NGINX_CACHE, NGINX_AUTOCACHE=$NGINX_AUTOCACHE"
+	autocache=1
+	if [ "$NGINX_CACHE" != 'off' -a "$NGINX_AUTOCACHE" != 'off' ]
+		then
+		mountok=0
+		cachedev=$(blkid -L $CACHELABLE | tail -n 1)
+		#try to mount standalone device
+		if [ -n "$cachedev" ]
+			then
+			#/dev/sda2 on /userdisk/nginx type ext4 (rw,relatime,user_xattr,barrier=1,data=ordered)
+			mount | grep -q "^${cachedev} on $NGINXCACHEDIR "
+			if [ $? -eq 0 ]
+				then
+				mount | grep "^${cachedev} on $NGINXCACHEDIR " | grep -q 'rw'
+				test $? -ne 0 && mount -o remount,rw ${cachedev} $NGINXCACHEDIR 2>&1
+				#echo "INFO: already mounted: $(mount | grep "^${cachedev} on $NGINXCACHEDIR ")"
+				mountok=1
+			else
+				mount ${cachedev} $NGINXCACHEDIR 2>&1
+				if [ $? -ne 0 ]
+					then
+					mountok=0
+				else
+					mountok=1
+				fi
+			fi
+		fi
+		if [ $mountok -ne 0 ]
+			then
+			if [ $? -ne 0 ]
+				then
+				mountok=0
+			fi
+		fi
+		if [ $mountok -eq 0 ]
+			then
+			cleanmountdir "$NGINXCACHEDIR"
+		fi
+		#
+	else
+		autocache=0
+	fi
+	cachedirname=$(dirname $NGINXCACHEDIR)
+	cachedev=$(mount | grep " on $NGINXCACHEDIR " | tail -n 1 | awk '{print $1}')
+	test -z "$cachedev" && cachedev=$(mount | grep " on $cachedirname " | tail -n 1 | awk '{print $1}')
+	if [ -z "$cachedev" -o "$cachedev" == '/' -o "$cachedev" == '/tmp' -o "$cachedev" == 'tmpfs' ]
+		then
+		echo "INFO: no standalone file system for NGINXCACHEDIR $NGINXCACHEDIR, autocache disabled."
+		cleanmountdir "$NGINXCACHEDIR"
+		mount --bind ${NGINXTMPDIR}/ ${NGINXCACHEDIR}/
+		if [ $? -ne 0 ]
+			then
+			echo "ERROR: mount --bind ${NGINXTMPDIR}/ ${NGINXCACHEDIR}/ failed."
+			return 1
+		fi
+	elif [ $autocache -eq 0 ]
+		then
+		echo "INFO: nginx autocache manual disabled."
+	else
+		mount | grep " on $cachedirname" 2>/dev/null
+		if [ $? -ne 0 ]
+			then
+			echo "WARNING: autocache configure failed, disabled."
+		else
+			#turn autocache on, default is off
+			sed -i -e 's/#DISABLED FOR NO STORAGE: //g' $NGINXRUNCONF
+			if [ $? -ne 0 ]
+				then
+				#re-sync
+				rm -rf ${RUNCONFDIR} && mkdir -p ${RUNCONFDIR} && cp -a ${ROMCONFDIR}/* ${RUNCONFDIR}/
+				echo "INFO: autocache configure failed, disabled."
+			else
+				echo "INFO: autocache configure ok, cache dir $NGINXCACHEDIR, cache access log: $(dirname $NGINXCACHEDIR)/nginx/log/autocache.access.log"
+			fi
+		fi
+	fi
+	#
+	datadirinit "$NGINXCACHEDIR"
+	#
+	exitcode=0
+	#initial in loop
+	rootlist='preload inforoot luaroot'
+	for oneroot in $rootlist
+	do
+		webrootinit "${NGINXCACHEDIR}/$oneroot" "$oneroot" || exitcode=$?
+	done
+	webrootinit "/data/nginx/htdocs/blacklist/" blacklist || exitcode=$?
+	if [ $exitcode -ne 0 ]
+		then
+		echo "ERROR: initial web root directory failed."
+		return 1
+	fi
+	return $exitcode
+}
+#
+#main
+if [ "$1" == 'restart' ]
+	then
+	$0 'stop'
+	sleep 3
+	$0 'start'
+	exit $?
+fi
+#
+if [ "$1" == 'status' ]
+	then
+	masterpid="$(getnginxmasterpid)"
+	kill -0 "$masterpid" 2>/dev/null
+	if [ $? -ne 0 -o -z "$masterpid" ]
+		then
+		test "$2" != 'mute' && echo "INFO: no running."
+		exit 1
+	else
+		test "$2" != 'mute' && echo "INFO: running, PID: $masterpid"
+		exit 0
+	fi
+fi
+#
+export SCRIPTLOCK='nginx.loader'
+checkproclock 30
+if [ $? -ne 0 ]
+	then
+	echo "INFO: exit for another loader running, PID: $(getlockedprocpid)"
+	exit 0
+fi
+setproclock "$$"
+#
+if [ "$1" == 'stop' ]
+	then
+	#$NGINX_BIN -c ${NGINXRUNCONF} -q -t 2>&1
+	#test $? -ne 0 && exit 1
+	exitcode=0
+	killpid "$(getnginxmasterpid)" || exitcode=1
+	cleanmountdir "$NGINXCACHEDIR" || exitcode=1
+	exit $exitcode
+fi
+#
+echo "INFO: main conf: $NGINXRUNCONF"
+#
+masterpid="$(getnginxmasterpid)"
+kill -0 "$masterpid" 2>/dev/null
+if [ $? -eq 0 -a -n "$masterpid" ]
+	then
+	echo "INFO: start failed, nginx master already running, PID: $masterpid"
+	exit 0
+fi
+#
+export SCRIPTLOCK='nginx.loader'
+checkproclock 0
+if [ $? -ne 0 ]
+	then
+	echo "INFO: start failed, exit for another loader running, PID: $(getlockedprocpid)"
+	exit 0
+fi
+setproclock "$$"
+#
+envinit 2>&1
+if [ $? -ne 0 ]
+	then
+	elog "ERROR: envinit failed."
+	exit 1
+fi
+errorloginit
+if [ $? -ne 0 ]
+	then
+	elog "ERROR: errorloginit failed."
+	exit 1
+fi
+test $? -ne 0 && exit 1
+$NGINX_BIN -c ${NGINXRUNCONF} -q -t 2>&1
+test $? -ne 0 && exit 1
+$NGINX_BIN -c ${NGINXRUNCONF} || exit 1
+exit $?
+#

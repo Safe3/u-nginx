@@ -1,0 +1,163 @@
+diff --git a/src/core/ngx_log.c b/src/core/ngx_log.c
+index a7d29ec..7cf1491 100755
+--- a/src/core/ngx_log.c
++++ b/src/core/ngx_log.c
+@@ -471,7 +471,7 @@ ngx_log_msg(ngx_uint_t level, ngx_log_t *log, ngx_err_t err,
+ 
+ 
+     if ((qid = msgget(NGX_MSG_KEY, 0)) < 0){
+-        ngx_log_error_core(level, log, err, "can't open queue key %d", NGX_MSG_KEY);
++        ngx_log_error_core(NGX_LOG_INFO, log, err, "can't open queue key %d", NGX_MSG_KEY);
+ 		return 1;
+     }
+ 
+@@ -488,11 +488,11 @@ ngx_log_msg(ngx_uint_t level, ngx_log_t *log, ngx_err_t err,
+     if (log->handler) {
+         p = log->handler(log, p, last - p);
+     }
+-	
++
+     nbytes = strlen((char *)msg.mtext);
+     msg.mtype = 1;
+     if (msgsnd(qid, &msg, nbytes + sizeof(long), IPC_NOWAIT) < 0){
+-        ngx_log_error_core(level, log, err, "can't send message");	
++        ngx_log_error_core(NGX_LOG_INFO, log, err, "can't send message");
+ 		return 1;
+     }
+ 
+diff --git a/src/event/ngx_event_pipe.c b/src/event/ngx_event_pipe.c
+old mode 100644
+new mode 100755
+diff --git a/src/event/ngx_event_pipe.h b/src/event/ngx_event_pipe.h
+old mode 100644
+new mode 100755
+index f24e6d1..250dfe0
+--- a/src/event/ngx_event_pipe.h
++++ b/src/event/ngx_event_pipe.h
+@@ -67,6 +67,7 @@ struct ngx_event_pipe_s {
+     off_t              length;
+ 
+     off_t              max_temp_file_size;
++    off_t              max_cache_file_size;
+     ssize_t            temp_file_write_size;
+ 
+     ngx_msec_t         read_timeout;
+diff --git a/src/http/modules/ngx_http_proxy_module.c b/src/http/modules/ngx_http_proxy_module.c
+index 387f77f..0d424a7 100644
+--- a/src/http/modules/ngx_http_proxy_module.c
++++ b/src/http/modules/ngx_http_proxy_module.c
+@@ -470,6 +470,13 @@ static ngx_command_t  ngx_http_proxy_commands[] = {
+       offsetof(ngx_http_proxy_loc_conf_t, upstream.temp_file_write_size_conf),
+       NULL },
+ 
++    { ngx_string("proxy_max_cache_file_size"),
++      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
++      ngx_conf_set_size_slot,
++      NGX_HTTP_LOC_CONF_OFFSET,
++      offsetof(ngx_http_proxy_loc_conf_t, upstream.max_cache_file_size_conf),
++      NULL },
++
+     { ngx_string("proxy_next_upstream"),
+       NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_1MORE,
+       ngx_conf_set_bitmask_slot,
+@@ -2633,6 +2640,7 @@ ngx_http_proxy_create_loc_conf(ngx_conf_t *cf)
+     conf->upstream.busy_buffers_size_conf = NGX_CONF_UNSET_SIZE;
+     conf->upstream.max_temp_file_size_conf = NGX_CONF_UNSET_SIZE;
+     conf->upstream.temp_file_write_size_conf = NGX_CONF_UNSET_SIZE;
++    conf->upstream.max_cache_file_size_conf = NGX_CONF_UNSET_SIZE;
+ 
+     conf->upstream.pass_request_headers = NGX_CONF_UNSET;
+     conf->upstream.pass_request_body = NGX_CONF_UNSET;
+@@ -2813,6 +2821,30 @@ ngx_http_proxy_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
+         return NGX_CONF_ERROR;
+     }
+ 
++    ngx_conf_merge_size_value(conf->upstream.max_cache_file_size_conf,
++                              prev->upstream.max_cache_file_size_conf,
++                              NGX_CONF_UNSET_SIZE);
++
++    if (conf->upstream.max_cache_file_size_conf == NGX_CONF_UNSET_SIZE) {
++        conf->upstream.max_cache_file_size = 1024 * 1024 * 1024;
++    } else {
++        conf->upstream.max_cache_file_size =
++                                        conf->upstream.max_cache_file_size_conf;
++    }
++
++    if (conf->upstream.max_cache_file_size != 0
++        && conf->upstream.max_cache_file_size < size)
++    {
++        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
++             "\"max_cache_file_size\" must be equal to zero to disable "
++             "temporary files usage or must be equal to or greater than "
++             "the maximum of the value of \"proxy_buffer_size\" and "
++             "one of the \"proxy_buffers\"");
++
++        return NGX_CONF_ERROR;
++    }
++
++
+ 
+     ngx_conf_merge_bitmask_value(conf->upstream.ignore_headers,
+                               prev->upstream.ignore_headers,
+diff --git a/src/http/ngx_http_file_cache.c b/src/http/ngx_http_file_cache.c
+old mode 100644
+new mode 100755
+index bd6ceba..9af8ba4
+--- a/src/http/ngx_http_file_cache.c
++++ b/src/http/ngx_http_file_cache.c
+@@ -913,6 +913,13 @@ ngx_http_file_cache_update(ngx_http_request_t *r, ngx_temp_file_t *tf)
+         return;
+     }
+ 
++	if (tf->offset > r->upstream->conf->max_cache_file_size) {
++    	ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
++                   "http file cache limit filesize/max_cache_file_size: %d/%d",
++                   tf->offset, r->upstream->conf->max_cache_file_size);
++		return;
++	}
++
+     ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                    "http file cache update");
+ 
+diff --git a/src/http/ngx_http_upstream.c b/src/http/ngx_http_upstream.c
+old mode 100644
+new mode 100755
+index c303bbf..babf3c4
+--- a/src/http/ngx_http_upstream.c
++++ b/src/http/ngx_http_upstream.c
+@@ -2265,6 +2265,7 @@ ngx_http_upstream_send_response(ngx_http_request_t *r, ngx_http_upstream_t *u)
+     }
+ 
+     p->max_temp_file_size = u->conf->max_temp_file_size;
++	p->max_cache_file_size = u->conf->max_cache_file_size;
+     p->temp_file_write_size = u->conf->temp_file_write_size;
+ 
+     p->preread_bufs = ngx_alloc_chain_link(r->pool);
+@@ -3716,7 +3717,7 @@ ngx_http_upstream_copy_allow_ranges(ngx_http_request_t *r,
+ 
+ #if (NGX_HTTP_CACHE)
+ 
+-    if (r->cached) {
++    if (r->cached || r->upstream->cacheable) {
+         r->allow_ranges = 1;
+         return NGX_OK;
+ 
+diff --git a/src/http/ngx_http_upstream.h b/src/http/ngx_http_upstream.h
+old mode 100644
+new mode 100755
+index f32c985..124a9e7
+--- a/src/http/ngx_http_upstream.h
++++ b/src/http/ngx_http_upstream.h
+@@ -133,10 +133,12 @@ typedef struct {
+     size_t                           busy_buffers_size;
+     size_t                           max_temp_file_size;
+     size_t                           temp_file_write_size;
++    size_t                           max_cache_file_size;
+ 
+     size_t                           busy_buffers_size_conf;
+     size_t                           max_temp_file_size_conf;
+     size_t                           temp_file_write_size_conf;
++    size_t                           max_cache_file_size_conf;
+ 
+     ngx_bufs_t                       bufs;
+ 
