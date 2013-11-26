@@ -555,6 +555,8 @@ ngx_http_init_request(ngx_event_t *rev)
     ngx_int_t len;
     len = ngx_sock_ntop(c->dst_sockaddr, text, NGX_SOCKADDR_STRLEN, 1);
 
+    ngx_log_error(NGX_LOG_DEBUG,c->log, 0, "HTTP orig-dst re-route to %s ", text);
+
     //if get invalid address, just close the connection
     if(len <= 0 || ngx_strncmp(text,"0.0.0.1:65535",len) == 0){
         ngx_log_error(NGX_LOG_ALERT, c->log, 0, "cannot est session for 0.0.0.1:65535");
