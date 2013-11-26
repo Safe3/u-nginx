@@ -300,7 +300,7 @@ ngx_filter_read_handler(ngx_event_t *rev)
 		case NGX_REDIRECT_TO_DEFAULT:
 			ngx_filter_redirect_to(rev, cscf->default_ls);
 			break;
-		default: // NGX_REDIRECT_PAAS
+		default: // NGX_REDIRECT_PASS
 		    break;
 	}
 	return;
@@ -397,20 +397,19 @@ static int ngx_filter_redirect_regex(ngx_connection_t *c, ngx_listening_t **lsp)
 	char                 buf[NGX_BUF_SIZE];
     ngx_filter_regex_elt_t  *re;
 	int vector[18];
+	size_t buf_size;
 
     s = c->data;
 	cscf = ngx_filter_get_module_srv_conf(s, ngx_filter_core_module);
 
 	re = cscf->regex->elts;
+	buf_size = NGX_BUF_SIZE > cscf->buffer_size ? cscf->buffer_size : NGX_BUF_SIZE;
 	
-	n = recv(c->fd, buf, NGX_BUF_SIZE, MSG_PEEK);
+	n = recv(c->fd, buf, buf_size, MSG_PEEK);
 	err = ngx_socket_errno;
 
     ngx_log_debug2(NGX_LOG_DEBUG_TCP, c->log, err,
 			   "filter check recv(): [%d](%s)", n, buf);
-
-	n = recv(c->fd, buf, NGX_BUF_SIZE, MSG_PEEK);
-	err = ngx_socket_errno;
 	if (n > 0 || err == NGX_EAGAIN) {
 
 		ret = NGX_REGEX_NO_MATCHED;
@@ -446,7 +445,7 @@ static int ngx_filter_redirect_regex(ngx_connection_t *c, ngx_listening_t **lsp)
 			if (n >= (ngx_int_t)cscf->buffer_size) {
             	return NGX_REDIRECT_TO_DEFAULT;
 			}
-			return NGX_REDIRECT_PAAS;
+			return NGX_REDIRECT_PASS;
         }else if (ret < 0) {
             ngx_log_debug2(NGX_LOG_DEBUG_FILTER, c->log, 0,
                           " failed: %i on \"%s\"",
@@ -490,14 +489,14 @@ static int ngx_filter_redirect_regex(ngx_connection_t *c, ngx_listening_t **lsp)
 	}
 
     if (n == NGX_AGAIN || n == 0) {
-        return NGX_REDIRECT_PAAS;;
+        return NGX_REDIRECT_PASS;;
     }
 
     if (n == NGX_ERROR) {
         return NGX_REDIRECT_TO_DEFAULT;
     }
 
-    return NGX_REDIRECT_PAAS;
+    return NGX_REDIRECT_PASS;
 }
 
 static void ngx_filter_redirect_to(ngx_event_t *rev, ngx_listening_t *ls) {

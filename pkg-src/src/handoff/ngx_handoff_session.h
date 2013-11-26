@@ -11,7 +11,7 @@
 
 
 #define NGX_REDIRECT_TO          1
-#define NGX_REDIRECT_PAAS        2
+#define NGX_REDIRECT_PASS        2
 #define NGX_REDIRECT_TO_DEFAULT  3
 
 #define NGX_BUF_SIZE               10240
