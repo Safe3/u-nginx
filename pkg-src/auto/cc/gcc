@@ -20,7 +20,7 @@ have=NGX_COMPILER value="\"gcc $NGX_GCC_VER\"" . auto/define
 
 CC_TEST_FLAGS="-pipe"
 
-ngx_feature="gc0c -pipe switch"
+ngx_feature="gcc -pipe switch"
 ngx_feature_name=
 ngx_feature_run=no
 ngx_feature_incs=
@@ -51,6 +51,7 @@ esac
 #NGX_GCC_OPT="-O2"
 #NGX_GCC_OPT="-Os"
 NGX_GCC_OPT="-O0"
+>>>>>>> f5a2d0f7d8523de5da6f037e6edb1ff19289e05c
 
 #CFLAGS="$CFLAGS -fomit-frame-pointer"
 
