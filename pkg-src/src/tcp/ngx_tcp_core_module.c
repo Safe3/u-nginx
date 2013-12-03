@@ -87,6 +87,13 @@ static ngx_command_t  ngx_tcp_core_commands[] = {
       offsetof(ngx_tcp_core_srv_conf_t, timeout),
       NULL },
 
+    { ngx_string("idle_timeout"),
+      NGX_TCP_MAIN_CONF|NGX_TCP_SRV_CONF|NGX_CONF_TAKE1,
+      ngx_conf_set_msec_slot,
+      NGX_TCP_SRV_CONF_OFFSET,
+      offsetof(ngx_tcp_core_srv_conf_t, idle_timeout),
+      NULL },
+
     { ngx_string("server_name"),
       NGX_TCP_MAIN_CONF|NGX_TCP_SRV_CONF|NGX_CONF_TAKE1,
       ngx_conf_set_str_slot,
@@ -242,6 +249,7 @@ ngx_tcp_core_create_srv_conf(ngx_conf_t *cf)
 
     cscf->timeout = NGX_CONF_UNSET_MSEC;
     cscf->resolver_timeout = NGX_CONF_UNSET_MSEC;
+    cscf->idle_timeout = NGX_CONF_UNSET_MSEC;
     cscf->so_keepalive = NGX_CONF_UNSET;
     cscf->tcp_nodelay = NGX_CONF_UNSET;
 
@@ -282,6 +290,9 @@ ngx_tcp_core_merge_srv_conf(ngx_conf_t *cf, void *parent, void *child)
     ngx_conf_merge_msec_value(conf->timeout, prev->timeout, 60000);
     ngx_conf_merge_msec_value(conf->resolver_timeout,
                               prev->resolver_timeout, 30000);
+
+    //default set idle timeout as 30s
+    ngx_conf_merge_msec_value(conf->idle_timeout,prev->idle_timeout,30000);
 
     ngx_conf_merge_value(conf->so_keepalive, prev->so_keepalive, 0);
     ngx_conf_merge_value(conf->tcp_nodelay, prev->tcp_nodelay, 1);

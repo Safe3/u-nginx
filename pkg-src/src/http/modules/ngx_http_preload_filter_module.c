@@ -301,9 +301,11 @@ ngx_http_preload_filter_handler(ngx_http_request_t *r)
         return NGX_DECLINED;
     }
 
+    /*
     if (r != r->main && of.size == 0) {
         return ngx_http_send_header(r);
     }
+    */
 
     r->allow_ranges = 1;
 
@@ -317,7 +319,9 @@ ngx_http_preload_filter_handler(ngx_http_request_t *r)
         return NGX_HTTP_INTERNAL_SERVER_ERROR;
     }
 
+    /*
     rc = ngx_http_send_header(r);
+    */
 
     if (rc == NGX_ERROR || rc > NGX_OK || r->header_only) {
         return rc;
@@ -335,10 +339,13 @@ ngx_http_preload_filter_handler(ngx_http_request_t *r)
     b->file->log = log;
     b->file->directio = of.is_directio;
 
-    out.buf = b;
-    out.next = NULL;
+    //out.buf = b;
+    //out.next = NULL;
 
-    return ngx_http_output_filter(r, &out);
+    //return ngx_http_output_filter(r, &out);
+
+    ngx_str_t uri = ngx_string("/hit");
+    return ngx_http_internal_redirect(r,&uri,NULL);
 }
 
 

@@ -196,6 +196,7 @@ struct ngx_tcp_core_srv_conf_s {
 
     ngx_msec_t               timeout;
     ngx_msec_t               resolver_timeout;
+    ngx_msec_t               idle_timeout;
 
     ngx_flag_t               so_keepalive;
     ngx_flag_t               tcp_nodelay;

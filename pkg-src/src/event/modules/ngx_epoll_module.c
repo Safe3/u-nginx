@@ -635,9 +635,9 @@ ngx_epoll_process_events(ngx_cycle_t *cycle, ngx_msec_t timer, ngx_uint_t flags)
                        c->fd, revents, event_list[i].data.ptr);
 
         if (revents & (EPOLLERR|EPOLLHUP)) {
-            ngx_log_debug2(NGX_LOG_DEBUG_EVENT, cycle->log, 0,
-                           "epoll_wait() error on fd:%d ev:%04XD",
-                           c->fd, revents);
+            ngx_log_debug3(NGX_LOG_DEBUG_EVENT, cycle->log, 0,
+                           "epoll_wait() error on fd:%d ev:%04XD %s",
+                           c->fd, revents,strerror(errno));
         }
 
 #if 0

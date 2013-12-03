@@ -257,6 +257,8 @@ ngx_tcp_init_session(ngx_connection_t *c)
     s->start_sec = tp->sec;
     s->start_msec = tp->msec;
 
+    s->last_act_ts = (ngx_msec_t) tp->sec * 1000 + tp->msec;
+
     s->bytes_read = 0;
     s->bytes_write = 0;
 

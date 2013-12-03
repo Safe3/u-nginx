@@ -22,6 +22,10 @@ static ngx_listening_t *ngx_handoff_find_ls(ngx_conf_t *cf, in_port_t port);
 static char *ngx_handoff_log_set_access_log(ngx_conf_t *cf, ngx_command_t *cmd,
     void *conf);
 
+
+extern ngx_module_t  ngx_http_preload_cache_module;
+
+
 static ngx_command_t  ngx_handoff_core_commands[] = {
 
     { ngx_string("server"),
@@ -38,7 +42,7 @@ static ngx_command_t  ngx_handoff_core_commands[] = {
       0,
       NULL },
     { ngx_string("redirect"),
-      NGX_HANDOFF_SRV_CONF|NGX_CONF_TAKE2,
+      NGX_HANDOFF_SRV_CONF|NGX_CONF_TAKE3,
       ngx_handoff_core_redirect,
       NGX_HANDOFF_SRV_CONF_OFFSET,
       0,
@@ -97,7 +101,7 @@ static ngx_str_t  ngx_handoff_access_log = ngx_string("logs/handoff_access.log")
 
 
 static void *
-ngx_handoff_core_create_main_conf(ngx_conf_t *cf) 
+ngx_handoff_core_create_main_conf(ngx_conf_t *cf)
 {
     ngx_handoff_core_main_conf_t  *cmcf;
 
@@ -119,7 +123,7 @@ ngx_handoff_core_create_main_conf(ngx_conf_t *cf)
         return NULL;
     }
 
-    if (ngx_array_init(&cmcf->virtual_servers, cf->pool, 4, 
+    if (ngx_array_init(&cmcf->virtual_servers, cf->pool, 4,
                        sizeof(ngx_handoff_virtual_server_t)) != NGX_OK)
     {
         return NULL;
@@ -132,7 +136,7 @@ ngx_handoff_core_create_main_conf(ngx_conf_t *cf)
 
 
 static void *
-ngx_handoff_core_create_srv_conf(ngx_conf_t *cf) 
+ngx_handoff_core_create_srv_conf(ngx_conf_t *cf)
 {
     ngx_handoff_core_srv_conf_t  *cscf;
     ngx_handoff_log_srv_conf_t   *lscf;
@@ -148,9 +152,10 @@ ngx_handoff_core_create_srv_conf(ngx_conf_t *cf)
      *     cscf->protocol = NULL;
      */
 
-	cscf->regex = NGX_CONF_UNSET_PTR;
 	cscf->default_ls = NGX_CONF_UNSET_PTR;
-	
+	cscf->preload_ls = NGX_CONF_UNSET_PTR;
+	cscf->preload_shm_zone= NGX_CONF_UNSET_PTR;
+
 
 
     cscf->timeout = NGX_CONF_UNSET_MSEC;
@@ -159,7 +164,7 @@ ngx_handoff_core_create_srv_conf(ngx_conf_t *cf)
     cscf->file_name = cf->conf_file->file.name.data;
     cscf->line = cf->conf_file->line;
 
-    lscf = cscf->access_log = ngx_pcalloc(cf->pool, 
+    lscf = cscf->access_log = ngx_pcalloc(cf->pool,
                                           sizeof(ngx_handoff_log_srv_conf_t));
     if (lscf == NULL) {
         return NULL;
@@ -178,7 +183,7 @@ ngx_handoff_core_create_srv_conf(ngx_conf_t *cf)
 
 
 static char *
-ngx_handoff_core_merge_srv_conf(ngx_conf_t *cf, void *parent, void *child) 
+ngx_handoff_core_merge_srv_conf(ngx_conf_t *cf, void *parent, void *child)
 {
     ngx_handoff_log_t           *log;
     ngx_handoff_core_srv_conf_t *prev = parent;
@@ -311,7 +316,7 @@ ngx_handoff_core_server(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 
 
 static char *
-ngx_handoff_core_listen(ngx_conf_t *cf, ngx_command_t *cmd, void *conf) 
+ngx_handoff_core_listen(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 {
     size_t                      len, off;
     in_port_t                   port;
@@ -404,7 +409,7 @@ ngx_handoff_core_listen(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
     for (i = 2; i < cf->args->nelts; i++) {
 		if (ngx_strcmp(value[i].data, "tproxy") == 0) {
 #if (NGX_HAVE_TPROXY)
-			ls->tproxy = 1; 
+			ls->tproxy = 1;
 #else
 			ngx_conf_log_error(NGX_LOG_WARN, cf, 0,
 			"TPROXY support is not enabled, ignoring option \"tproxy\" in %V",
@@ -495,83 +500,79 @@ ngx_handoff_core_listen(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 static char *
 ngx_handoff_core_redirect(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 {
-#if (NGX_PCRE)
 
     ngx_handoff_core_srv_conf_t *cscf = conf;
 
-    ngx_str_t                  *value;
-	ngx_handoff_regex_elt_t            *re;
-	ngx_regex_compile_t         rc;
-	int                         port;
+    ngx_str_t                  *value, v;
+	int                         port, i;
 	ngx_listening_t            *ls;
 	u_char                      errstr[NGX_MAX_CONF_ERRSTR];
 
     value = cf->args->elts;
 
-	//check port
-	port = ngx_atoi(value[2].data, value[2].len);
-	if (port < 1 || port > 65535) {
-        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
-                "the invalid \"%V\" port", &value[2]);
-		return NGX_CONF_ERROR;
-	}
 
-	ls = ngx_handoff_find_ls(cf, (in_port_t)port);
-	if(ls == NULL){
-        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
-                "\"%V\" port isn't listening", &value[3]);
-		return NGX_CONF_ERROR;		
-	}
+    for (i = 1; i < cf->args->nelts; i++) {
 
-	// default
-	if (ngx_strcmp(value[1].data, "default") == 0) {
-		if(cscf->default_ls != NGX_CONF_UNSET_PTR){
-	        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
-	                "too many redirect default");
-			return NGX_CONF_ERROR;
-		}
-		cscf->default_ls = ls;
-		return NGX_CONF_OK;
-	}
+        if (ngx_strncmp(value[i].data, "preload_port=", 13) == 0) {
+            v.len = value[i].len - 13;
+            v.data = value[i].data + 13;
 
-	// regex add 
-	
+			//check port
+			port = ngx_atoi(v.data, v.len);
+			if (port < 1 || port > 65535) {
+				ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+						"the invalid \"%V\" preload port", &v);
+				return NGX_CONF_ERROR;
+			}
 
-    if (cscf->regex == NGX_CONF_UNSET_PTR) {
-        cscf->regex = ngx_array_create(cf->pool, 4, sizeof(ngx_handoff_regex_elt_t));
-        if (cscf->regex == NULL) {
-            return NGX_CONF_ERROR;
+			cscf->preload_ls = ngx_handoff_find_ls(cf, (in_port_t)port);
+			if(cscf->preload_ls == NULL){
+				ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+						"\"%V\" preload port isn't listening", &v);
+				return NGX_CONF_ERROR;
+			}
+            continue;
         }
+
+		if (ngx_strncmp(value[i].data, "default_port=", 13) == 0) {
+			v.len = value[i].len - 13;
+			v.data = value[i].data + 13;
+
+			//check port
+			port = ngx_atoi(v.data, v.len);
+			if (port < 1 || port > 65535) {
+				ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+						"the invalid \"%V\" default port", &v);
+				return NGX_CONF_ERROR;
+			}
+
+			cscf->default_ls= ngx_handoff_find_ls(cf, (in_port_t)port);
+			if(cscf->default_ls == NULL){
+				ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+						"\"%V\" port isn't default listening", &v);
+				return NGX_CONF_ERROR;
+			}
+			continue;
+		}
+
+		if (ngx_strncmp(value[i].data, "zone=", 5) == 0) {
+
+			v.len = value[i].len - 5;
+			v.data = value[i].data + 5;
+
+			cscf->preload_shm_zone = ngx_shared_memory_add(cf, &v, 0,
+				&ngx_http_preload_cache_module);
+			if (cscf->preload_shm_zone == NULL) {
+				return NGX_CONF_ERROR;
+			}
+
+    	}
     }
-
-    re = ngx_array_push(cscf->regex);
-    if (re == NULL) {
-        return NGX_CONF_ERROR;
-    }
-
-
-	ngx_memzero(&rc, sizeof(ngx_regex_compile_t));
-    rc.pattern = value[1];
-    rc.pool = cf->pool;
-    rc.err.len = NGX_MAX_CONF_ERRSTR;
-    rc.err.data = errstr;
-
-	if (ngx_regex_compile(&rc) != NGX_OK) {
-		ngx_conf_log_error(NGX_LOG_EMERG, cf, 0, "%V", &rc.err);
-		return NGX_CONF_ERROR;
-	}
-
-	re->regex = rc.regex;
-	re->ls = ls;
 
     return NGX_CONF_OK;
-#else
 
-    ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
-                       "\"%V\" requires PCRE library", &cmd->name);
-    return NGX_CONF_ERROR;
 
-#endif	
+
 }
 
 
@@ -580,23 +581,23 @@ static ngx_listening_t *
 ngx_handoff_find_ls(ngx_conf_t *cf, in_port_t port)
 {
 	ngx_listening_t       *ls;
-	ngx_uint_t             n; 
+	ngx_uint_t             n;
     struct sockaddr       *sa;
     struct sockaddr_in    *sin;
     in_port_t              p;
 
-	
+
 	ls = cf->cycle->listening.elts;
 	for (n = 0; n < cf->cycle->listening.nelts; n++){
 		sa = (struct sockaddr *) (&ls[n])->sockaddr;
-	
+
 		switch (sa->sa_family) {
-	
+
 #if (NGX_HAVE_INET6)
 		case AF_INET6:
 			return NULL;
 #endif
-	
+
 		default: /* AF_INET */
 			sin = (struct sockaddr_in *) sa;
 			p = ntohs(sin->sin_port);

@@ -39,6 +39,8 @@ typedef struct ngx_tcp_session_s {
     ngx_str_t              *addr_text;
     ngx_str_t               host;
 
+    ngx_msec_t              last_act_ts;
+
 } ngx_tcp_session_t;
 
 

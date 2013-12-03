@@ -325,8 +325,55 @@ ngx_tcp_proxy_handler(ngx_event_t *ev)
     s = c->data;
 
     cscf = ngx_tcp_get_module_srv_conf(s, ngx_tcp_core_module);
+    pctx = ngx_tcp_get_module_ctx(s, ngx_tcp_proxy_module);
+    pcf = ngx_tcp_get_module_srv_conf(s, ngx_tcp_proxy_module);
 
     if (ev->timedout) {
+        ngx_msec_t cur = ngx_current_msec;
+
+        //if idle duration is larger then idle_timeout, then clear the session
+        if (cur - s->last_act_ts < cscf->idle_timeout) {
+
+            //renew timer
+            if (c == s->connection) {
+                ngx_add_timer(c->read, cscf->timeout);
+            }
+
+            if (c == pctx->upstream->connection) {
+                if (ev->write) {
+                    ngx_add_timer(c->write, pcf->upstream.send_timeout);
+                } else {
+                    ngx_add_timer(c->read, pcf->upstream.read_timeout);
+                }
+            }
+
+            //re-add read/write event fd
+            if (ngx_handle_write_event(pctx->upstream->connection->write, 0) != NGX_OK) {
+                ngx_tcp_finalize_session(s);
+                return;
+            }
+
+            if (ngx_handle_read_event(pctx->upstream->connection->read, 0) != NGX_OK) {
+                ngx_tcp_finalize_session(s);
+                return;
+            }
+
+            if (ngx_handle_write_event(s->connection->write, 0) != NGX_OK) {
+                ngx_tcp_finalize_session(s);
+                return;
+            }
+
+            if (ngx_handle_read_event(s->connection->read, 0) != NGX_OK) {
+                ngx_tcp_finalize_session(s);
+                return;
+            }
+
+
+            c->timedout = 0;
+
+            return;
+        }
+
         c->log->action = "proxying";
 
         ngx_log_error(NGX_LOG_INFO, c->log, NGX_ETIMEDOUT, "proxy timed out");
@@ -334,9 +381,8 @@ ngx_tcp_proxy_handler(ngx_event_t *ev)
 
         ngx_tcp_finalize_session(s);
         return;
-    }
 
-    pctx = ngx_tcp_get_module_ctx(s, ngx_tcp_proxy_module);
+    }
 
     if (pctx == NULL) {
         ngx_tcp_finalize_session(s);
@@ -392,9 +438,9 @@ ngx_tcp_proxy_handler(ngx_event_t *ev)
     first_read = 0;
 #endif
 
-    ngx_log_debug4(NGX_LOG_DEBUG_TCP, ev->log, 0,
-                   "tcp proxy handler: %d, #%d > #%d, time:%ui",
-                   do_write, src->fd, dst->fd, ngx_current_msec);
+    ngx_log_debug5(NGX_LOG_DEBUG_TCP, ev->log, 0,
+                   "tcp proxy handler at %s: %s, #%d > #%d, time:%ui",(c == s->connection)?"Client":"Upstream",
+                   do_write?"write":"read", src->fd, dst->fd, ngx_current_msec);
 
     for ( ;; ) {
 
@@ -471,6 +517,9 @@ ngx_tcp_proxy_handler(ngx_event_t *ev)
         break;
     }
 
+    //update act timestamp
+    s->last_act_ts = ngx_current_msec;
+
     c->log->action = "nginx tcp proxying";
 
     if ((s->connection->read->eof && s->buffer->pos == s->buffer->last)
@@ -507,8 +556,6 @@ ngx_tcp_proxy_handler(ngx_event_t *ev)
         ngx_tcp_finalize_session(s);
         return;
     }
-
-    pcf = ngx_tcp_get_module_srv_conf(s, ngx_tcp_proxy_module);
 
     if (c == s->connection) {
         ngx_add_timer(c->read, cscf->timeout);

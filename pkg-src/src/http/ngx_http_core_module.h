@@ -431,8 +431,6 @@ struct ngx_http_core_loc_conf_s {
 
     ngx_queue_t  *locations;
 
-    ngx_array_t   *redirect;
-
 #if 0
     ngx_http_core_loc_conf_t  *prev_location;
 #endif

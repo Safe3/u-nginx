@@ -192,8 +192,9 @@ typedef struct {
 
 struct ngx_handoff_core_srv_conf_s {
 
-	ngx_array_t 			*regex;
 	ngx_listening_t         *default_ls;
+	ngx_listening_t         *preload_ls;
+	ngx_shm_zone_t          *preload_shm_zone;
 
     size_t                   buffer_size;
 
